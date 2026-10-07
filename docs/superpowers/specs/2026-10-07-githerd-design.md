@@ -1,4 +1,4 @@
-# gitai — Plain-English Multi-Repo Git CLI (Design)
+# githerd — Plain-English Multi-Repo Git CLI (Design)
 
 Date: 2026-10-07
 Status: Draft for review
@@ -86,7 +86,7 @@ Goal: swapping provider or model is a config change; no agent, tool or UI code c
   - `openai`, `openrouter`: `openai-compatible` with their base URLs, key required.
   - `anthropic`: Claude via the `anthropic` SDK, key required.
   - `custom`: any OpenAI-compatible `base_url` + optional key.
-- Local models vary in tool-calling quality. The adapter reports `supports_tools`; when a chosen Ollama model lacks it, gitai warns at setup and falls back to a constrained mode (plain-text intent parsing into the same tools) rather than failing. Running locally also means diffs never leave the machine, so the commit-draft privacy notice is skipped for `ollama`.
+- Local models vary in tool-calling quality. The adapter reports `supports_tools`; when a chosen Ollama model lacks it, githerd warns at setup and falls back to a constrained mode (plain-text intent parsing into the same tools) rather than failing. Running locally also means diffs never leave the machine, so the commit-draft privacy notice is skipped for `ollama`.
 - **Factory** (`llm/factory.py`): `build_client(config.llm) -> LLMClient`, chosen by `provider` in config (`openai-compatible` or `anthropic`). Model name is a free string passed through; nothing branches on model name.
 - **Capability flags** on the client (`supports_tools`, `supports_streaming`) so the agent can degrade (e.g. no tools: plain-text fallback with a clear message) instead of special-casing models.
 - **Error mapping:** each adapter maps SDK exceptions to neutral `LLMAuthError`, `LLMRateLimitError`, `LLMTimeoutError`, `LLMError`, which is all the agent and UI handle.
@@ -129,7 +129,7 @@ The model sees compact summaries (e.g. `5 Ok, 1 UpToDate, 1 BlockedDirty(infra: 
 
 ## 6. Undo
 
-- Before each mutation, `gitops` records `{repo, op, before_head, after_head, timestamp}` in a session journal under `.gitai/` at the working-directory root (repos themselves are untouched).
+- Before each mutation, `gitops` records `{repo, op, before_head, after_head, timestamp}` in a session journal under `.githerd/` at the working-directory root (repos themselves are untouched).
 - "Undo that" reverses the last operation set, restoring each affected repo to its `before_head`.
 - Fast-forward pulls, commits and amends: reset to `before_head`. Stashes: popped. Branch switches: switched back.
 - If undoing would discard work done after the operation, the normal destructive confirmation applies first.
@@ -146,9 +146,9 @@ The model sees compact summaries (e.g. `5 Ok, 1 UpToDate, 1 BlockedDirty(infra: 
 ## 8. Config and first run
 
 - First-run wizard: choose a preset (NVIDIA free tier, local Ollama, OpenAI, OpenRouter, Anthropic, custom), paste key if the preset needs one, pick model (Ollama: from detected installed models), verify with a test call.
-- Config at `%APPDATA%\gitai\config.toml`; key in Credential Manager, never in the file.
+- Config at `%APPDATA%\githerd\config.toml`; key in Credential Manager, never in the file.
 - Settings: concurrency, diff size cap, repo-discovery ignore globs, privacy-notice acknowledgement.
-- `gitai config` to change provider later.
+- `githerd config` to change provider later.
 - Config `[llm]` holds `provider` (`openai-compatible` | `anthropic`), `model`, and `base_url` (openai-compatible only). Default: `provider = "openai-compatible"`, NVIDIA endpoint below. Claude users set `provider = "anthropic"` and a Claude model name.
 - NVIDIA endpoint: `https://integrate.api.nvidia.com/v1` (OpenAI-compatible). The model must support reliable tool calling; candidate models are evaluated early (an explicit first implementation task).
 
