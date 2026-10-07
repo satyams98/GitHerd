@@ -11,7 +11,8 @@ A Windows terminal tool. Opened in a directory, it discovers every git repo bene
 
 ### Platform and stack
 - Windows only (Windows Terminal; `cmd.exe` best-effort).
-- Python. Typer (CLI), Textual (TUI), asyncio, pydantic, `openai` SDK, `keyring`.
+- Python. Typer (CLI), Textual (TUI), asyncio, pydantic, `keyring`.
+- LLM access through two official SDKs behind one neutral interface: `openai` (covers NVIDIA build, OpenRouter, Ollama, OpenAI and any OpenAI-compatible endpoint via `base_url`) and `anthropic` (Claude). No other code imports either SDK.
 - Install via `uv tool install` / `pipx`; PyInstaller `.exe` is a later option.
 
 ### v1 features
@@ -64,10 +65,25 @@ Agent loop (LLM) ─▶ Tool registry ─▶ Git ops layer (async)
 | `gitops` | Async git runner; one function per operation; emits progress events; returns typed `Outcome`. | git, pydantic |
 | `safety` | Classifies an operation as `read`, `mutate` or `destructive`. Enforced in code. | gitops |
 | `tools` | LLM-facing tool schemas: single-repo tools plus bulk tools (`pull_repos`, `fetch_repos`, `status_all`) that drive the parallel dashboard as one call. | gitops, safety, repos |
-| `agent` | LLM loop; sends messages + repo summary; executes tool calls; returns compact outcome summaries. Provider-agnostic (`base_url`, key, model). | openai SDK, tools |
+| `llm` | Provider/model-independent LLM layer: neutral types plus `LLMClient` protocol and two adapters (`OpenAIClient`, `AnthropicClient`). The only place SDKs are imported. See §3.1. | openai SDK, anthropic SDK |
+| `agent` | LLM loop; sends messages + repo summary; executes tool calls; returns compact outcome summaries. Knows nothing about providers or models; depends only on the `llm` interface. | llm, tools |
 | `undo` | Journal of operations; reverses an operation set. | gitops |
 | `ui` | Textual app rendering chat, dashboard, cards, diff viewer from `Outcome` and progress events only. | textual |
 | `config` | Provider settings; key in Windows Credential Manager. | keyring |
+
+### 3.1 LLM abstraction (provider- and model-independent)
+
+Goal: swapping provider or model is a config change; no agent, tool or UI code changes.
+
+- **Neutral types** (pydantic, defined in `llm/types.py`): `Message(role, content, tool_calls, tool_call_id)`, `ToolSpec(name, description, parameters_json_schema)`, `ToolCall(id, name, arguments: dict)`, `LLMResponse(text, tool_calls, usage, stop_reason)`.
+- **Interface** (`llm/base.py`): `class LLMClient(Protocol): async def complete(self, messages, tools, *, max_tokens) -> LLMResponse`. Streaming of text is optional via `stream(...)` yielding text deltas and a final `LLMResponse`.
+- **Adapters:**
+  - `OpenAIClient(base_url, api_key, model)` uses the `openai` SDK Chat Completions with function calling. Used for NVIDIA, OpenRouter, Ollama, OpenAI.
+  - `AnthropicClient(api_key, model)` uses the `anthropic` SDK Messages API with tool use, translating neutral messages (system prompt, `tool_use`/`tool_result` blocks) to and from Anthropic's shape.
+- **Factory** (`llm/factory.py`): `build_client(config.llm) -> LLMClient`, chosen by `provider` in config (`openai-compatible` or `anthropic`). Model name is a free string passed through; nothing branches on model name.
+- **Capability flags** on the client (`supports_tools`, `supports_streaming`) so the agent can degrade (e.g. no tools: plain-text fallback with a clear message) instead of special-casing models.
+- **Error mapping:** each adapter maps SDK exceptions to neutral `LLMAuthError`, `LLMRateLimitError`, `LLMTimeoutError`, `LLMError`, which is all the agent and UI handle.
+- **Testing:** the agent is tested with a `FakeLLMClient`; each adapter is tested against recorded/mocked SDK responses to verify the neutral translation both ways.
 
 ### Hybrid agent design
 The LLM decides and converses through tool calls. Common bulk operations are single tool calls that run the whole parallel dashboard and return one summary to the model, so the model reasons only about exceptions (e.g. the dirty repos) rather than every repo.
@@ -126,6 +142,7 @@ The model sees compact summaries (e.g. `5 Ok, 1 UpToDate, 1 BlockedDirty(infra: 
 - Config at `%APPDATA%\gitai\config.toml`; key in Credential Manager, never in the file.
 - Settings: concurrency, diff size cap, repo-discovery ignore globs, privacy-notice acknowledgement.
 - `gitai config` to change provider later.
+- Config `[llm]` holds `provider` (`openai-compatible` | `anthropic`), `model`, and `base_url` (openai-compatible only). Default: `provider = "openai-compatible"`, NVIDIA endpoint below. Claude users set `provider = "anthropic"` and a Claude model name.
 - NVIDIA endpoint: `https://integrate.api.nvidia.com/v1` (OpenAI-compatible). The model must support reliable tool calling; candidate models are evaluated early (an explicit first implementation task).
 
 ## 9. Testing
