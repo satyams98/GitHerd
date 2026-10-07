@@ -154,3 +154,24 @@ async def test_run_bulk_rejects_non_positive_concurrency(tmp_path):
 
     with pytest.raises(ValueError):
         await asyncio.wait_for(run_bulk([tmp_path / "r"], op, concurrency=0), timeout=5)
+
+
+async def test_run_bulk_failed_message_never_empty(tmp_path):
+    async def op(repo, progress):
+        raise RuntimeError()
+
+    results = await run_bulk([tmp_path / "r"], op)
+    assert results[tmp_path / "r"] == Failed(message="RuntimeError")
+
+
+async def test_pull_repos_survives_any_journal_exception(monkeypatch, make_repo, push_upstream, tmp_path):
+    root = tmp_path / "work"
+    a = make_repo("a")
+    push_upstream(a, "a.txt")
+
+    def boom(self, description, entries):
+        raise ValueError("bad journal")
+
+    monkeypatch.setattr(bulk.Journal, "record", boom)
+    results = await pull_repos(root, [a])
+    assert isinstance(results[a], Ok)

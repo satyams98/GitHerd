@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from githerd.outcomes import (
     AuthRequired, BlockedDirty, Diverged, Failed, NetworkError, Ok, Outcome, UpToDate,
 )
 from githerd.repos import snapshot
-from githerd.runner import ProgressCb, run_git
+from githerd.runner import GitError, ProgressCb, run_git
 
 _AUTH_MARKERS = (
     "authentication failed", "could not read username", "could not read password",
@@ -34,10 +35,24 @@ def classify_failure(stderr: str, remote: str = "") -> Outcome:
     return Failed(message=_tail(stderr) or "git failed")
 
 
+def redact_url(url: str) -> str:
+    """Strip any ``user[:password]@`` userinfo from a ``scheme://`` URL."""
+    if "://" not in url:
+        return url  # scp-style (git@host:path) and local paths carry no secret
+    try:
+        parts = urlsplit(url)
+        if "@" not in parts.netloc:
+            return url
+        host = parts.netloc.rsplit("@", 1)[1]
+        return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+    except ValueError:
+        return ""  # unparseable: safer to show nothing than risk leaking
+
+
 async def _remote_url(repo: Path, upstream: str | None) -> str:
     name = upstream.split("/", 1)[0] if upstream else "origin"
     res = await run_git(repo, "config", "--get", f"remote.{name}.url")
-    return res.stdout.strip() if res.ok else ""
+    return redact_url(res.stdout.strip()) if res.ok else ""
 
 
 async def _rev(repo: Path, ref: str) -> str:
@@ -46,6 +61,13 @@ async def _rev(repo: Path, ref: str) -> str:
 
 
 async def pull(repo: Path, on_progress: ProgressCb | None = None) -> Outcome:
+    try:
+        return await _pull(repo, on_progress)
+    except GitError as exc:
+        return Failed(message=str(exc))
+
+
+async def _pull(repo: Path, on_progress: ProgressCb | None) -> Outcome:
     snap = await snapshot(repo)
     if snap.branch is None:
         return Failed(message="detached HEAD: switch to a branch before pulling")
@@ -75,6 +97,13 @@ async def pull(repo: Path, on_progress: ProgressCb | None = None) -> Outcome:
 
 
 async def fetch(repo: Path, on_progress: ProgressCb | None = None) -> Outcome:
+    try:
+        return await _fetch(repo, on_progress)
+    except GitError as exc:
+        return Failed(message=str(exc))
+
+
+async def _fetch(repo: Path, on_progress: ProgressCb | None) -> Outcome:
     snap = await snapshot(repo)
     before = await _rev(repo, "@{u}")
     res = await run_git(repo, "fetch", "--progress", on_progress=on_progress)

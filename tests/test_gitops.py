@@ -85,3 +85,42 @@ async def test_fetch_reports_new_upstream_commits(make_repo, push_upstream, git)
 ])
 def test_classify_failure(stderr, expected):
     assert isinstance(classify_failure(stderr, remote="origin"), expected)
+
+
+async def test_pull_on_non_repo_returns_failed(tmp_path):
+    assert isinstance(await pull(tmp_path / "nope"), Failed)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert isinstance(await pull(plain), Failed)
+
+
+async def test_fetch_on_non_repo_returns_failed(tmp_path):
+    assert isinstance(await fetch(tmp_path / "nope"), Failed)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert isinstance(await fetch(plain), Failed)
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://user:ghp_SECRET@github.com/o/r.git", "https://github.com/o/r.git"),
+    ("https://token@host/x", "https://host/x"),
+    ("https://user:pw@host:8443/x.git", "https://host:8443/x.git"),
+    ("https://github.com/o/r.git", "https://github.com/o/r.git"),
+    ("git@github.com:o/r.git", "git@github.com:o/r.git"),
+    ("C:\\repos\\thing", "C:\\repos\\thing"),
+    ("/tmp/remote.git", "/tmp/remote.git"),
+    ("", ""),
+])
+def test_redact_url(url, expected):
+    from githerd.gitops import redact_url
+
+    assert redact_url(url) == expected
+
+
+@pytest.mark.parametrize("operation", [pull, fetch])
+async def test_outcome_never_contains_url_credentials(operation, make_repo, git):
+    repo = make_repo("a")
+    git(repo, "config", "remote.origin.url",
+        "https://user:ghp_SECRETTOKEN@127.0.0.1:1/o/r.git")
+    outcome = await operation(repo)
+    assert "ghp_SECRETTOKEN" not in outcome.model_dump_json()

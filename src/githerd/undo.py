@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Literal
 
@@ -16,6 +17,9 @@ _REVERSE_ARGS: dict[str, tuple[str, ...]] = {
 }
 
 
+log = logging.getLogger("githerd.undo")
+
+
 class UndoItem(BaseModel):
     repo: str
     status: Literal["restored", "skipped", "failed"]
@@ -28,6 +32,7 @@ async def undo_last(root: Path, journal: Journal) -> tuple[OpSet | None, list[Un
         return None, []
     items: list[UndoItem] = []
     reversals: list[JournalEntry] = []
+    retryable: list[JournalEntry] = []  # failed or moved: worth another attempt later
     restored_any = False
     for entry in op_set.entries:
         repo = Path(entry.repo)
@@ -36,10 +41,15 @@ async def undo_last(root: Path, journal: Journal) -> tuple[OpSet | None, list[Un
             items.append(UndoItem(repo=entry.repo, status="skipped",
                                   detail=f"no undo available for '{entry.op}'"))
             continue
-        head = (await run_git(repo, "rev-parse", "HEAD")).stdout.strip()
-        if head != entry.after_head:
+        head_res = await run_git(repo, "rev-parse", "HEAD")
+        if not head_res.ok:
+            items.append(UndoItem(repo=entry.repo, status="skipped",
+                                  detail="repo not found or not a git repository"))
+            continue
+        if head_res.stdout.strip() != entry.after_head:
             items.append(UndoItem(repo=entry.repo, status="skipped",
                                   detail="repo has moved since this operation; not undone"))
+            retryable.append(entry)
             continue
         res = await run_git(repo, *reverse, entry.before_head)
         if res.ok:
@@ -54,7 +64,14 @@ async def undo_last(root: Path, journal: Journal) -> tuple[OpSet | None, list[Un
         else:
             items.append(UndoItem(repo=entry.repo, status="failed",
                                   detail=res.stderr.strip().splitlines()[-1] if res.stderr.strip() else "git reset failed"))
+            retryable.append(entry)
     if restored_any:
-        journal.mark_undone(op_set.id)
-        journal.record(f"undo: {op_set.description}", reversals)
+        try:
+            journal.mark_undone(op_set.id)
+            journal.record(f"undo: {op_set.description}", reversals)
+            # Recorded last so the next `undo` retries the leftovers first.
+            journal.record(f"{op_set.description} (not yet undone)", retryable)
+        except OSError:
+            # The resets already happened; never turn a done undo into a crash.
+            log.exception("failed to update journal after undoing %s", op_set.id)
     return op_set, items

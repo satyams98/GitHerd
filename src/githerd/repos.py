@@ -116,7 +116,9 @@ async def snapshot_all(repos: list[Path], concurrency: int = 8) -> list[RepoSnap
         async with sem:
             try:
                 return await snapshot(repo)
-            except GitError as exc:
-                return RepoSnapshot(path=repo, name=repo.name, error=str(exc))
+            except Exception as exc:  # one repo must never sink the whole listing
+                return RepoSnapshot(
+                    path=repo, name=repo.name, error=str(exc) or type(exc).__name__
+                )
 
     return list(await asyncio.gather(*(one(r) for r in repos)))

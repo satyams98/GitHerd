@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import BaseModel
+
+
+log = logging.getLogger("githerd.journal")
 
 
 class JournalEntry(BaseModel):
@@ -28,7 +32,7 @@ class Journal:
         self.path = self.dir / "journal.jsonl"
 
     def _append(self, payload: dict) -> None:
-        self.dir.mkdir(exist_ok=True)
+        self.dir.mkdir(parents=True, exist_ok=True)
         ignore = self.dir / ".gitignore"
         if not ignore.exists():
             ignore.write_text("*\n", encoding="utf-8")  # keep the journal out of any repo
@@ -39,7 +43,20 @@ class Journal:
         if not self.path.exists():
             return []
         text = self.path.read_text(encoding="utf-8")
-        return [json.loads(ln) for ln in text.splitlines() if ln.strip()]
+        lines: list[dict] = []
+        for number, ln in enumerate(text.splitlines(), start=1):
+            if not ln.strip():
+                continue
+            try:
+                parsed = json.loads(ln)
+            except json.JSONDecodeError:
+                log.warning("skipping malformed journal line %d in %s", number, self.path)
+                continue
+            if isinstance(parsed, dict) and "type" in parsed:
+                lines.append(parsed)
+            else:
+                log.warning("skipping unrecognised journal line %d in %s", number, self.path)
+        return lines
 
     def record(self, description: str, entries: list[JournalEntry]) -> OpSet | None:
         if not entries:

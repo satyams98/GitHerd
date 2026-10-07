@@ -110,3 +110,20 @@ async def test_snapshot_all_isolates_failures(make_repo, tmp_path):
     assert snaps[0].error == ""
     assert snaps[1].error != ""
     assert snaps[1].name == "not-a-repo"
+
+
+async def test_snapshot_all_isolates_arbitrary_exceptions(monkeypatch, tmp_path):
+    from githerd import repos as repos_mod
+
+    good, bad, empty = tmp_path / "good", tmp_path / "bad", tmp_path / "empty"
+
+    async def fake_snapshot(repo):
+        if repo == bad:
+            raise ValueError("boom")
+        if repo == empty:
+            raise FileNotFoundError()
+        return repos_mod.RepoSnapshot(path=repo, name=repo.name)
+
+    monkeypatch.setattr(repos_mod, "snapshot", fake_snapshot)
+    snaps = await snapshot_all([good, bad, empty])
+    assert [s.error for s in snaps] == ["", "boom", "FileNotFoundError"]

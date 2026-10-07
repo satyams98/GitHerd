@@ -39,6 +39,7 @@ def git_env() -> dict[str, str]:
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"  # never block on a prompt
     env["LC_ALL"] = "C"  # stable English messages for stderr matching
+    env["GCM_INTERACTIVE"] = "never"  # Git Credential Manager must not open a prompt
     return env
 
 
@@ -66,13 +67,16 @@ async def _drain_stderr(stream: asyncio.StreamReader, on_progress: ProgressCb | 
 async def run_git(
     repo: Path | str, *args: str, on_progress: ProgressCb | None = None
 ) -> GitResult:
-    proc = await asyncio.create_subprocess_exec(
-        "git", "-C", str(repo), *args,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=git_env(),
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(repo), *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=git_env(),
+        )
+    except FileNotFoundError as exc:
+        raise GitError("git executable not found; install Git for Windows") from exc
     assert proc.stdout is not None and proc.stderr is not None
     try:
         stdout_b, stderr, _ = await asyncio.gather(

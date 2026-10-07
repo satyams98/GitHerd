@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import sys
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -17,6 +19,20 @@ app = typer.Typer(
     no_args_is_help=True,
     help="Herd all your git repos with plain English.",
 )
+
+
+@app.callback()
+def main() -> None:
+    """Herd all your git repos with plain English."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass  # test runners swap in streams that cannot be reconfigured
+    if shutil.which("git") is None:
+        typer.echo("git executable not found; install Git for Windows")
+        raise typer.Exit(code=1)
+
 
 RootOpt = Annotated[
     Optional[Path],
@@ -45,7 +61,8 @@ def status(root: RootOpt = None) -> None:
     width = max(len(s.name) for s in snaps)
     for s in snaps:
         if s.error:
-            typer.echo(f"{s.name:<{width}}  error: {s.error}")
+            first_line = s.error.splitlines()[0] if s.error.strip() else s.error
+            typer.echo(f"{s.name:<{width}}  error: {first_line}")
             continue
         branch = s.branch or "(detached)"
         sync = f"+{s.ahead}/-{s.behind}" if s.upstream else "no upstream"
@@ -80,4 +97,9 @@ def undo(root: RootOpt = None) -> None:
         return
     typer.echo(f"Undoing: {op_set.description}")
     for item in items:
-        typer.echo(f"{Path(item.repo).name}  {item.status}: {item.detail}")
+        suffix = f": {item.detail}" if item.detail else ""
+        typer.echo(f"{Path(item.repo).name}  {item.status}{suffix}")
+
+
+if __name__ == "__main__":
+    app()

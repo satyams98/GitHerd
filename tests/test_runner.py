@@ -38,3 +38,26 @@ async def test_run_git_streams_progress_lines(make_repo, tmp_path):
     )
     assert result.ok
     assert any("Cloning into" in line for line in lines)
+
+
+def test_git_env_is_non_interactive_and_stable():
+    import os
+
+    from githerd.runner import git_env
+
+    env = git_env()
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GCM_INTERACTIVE"] == "never"
+    assert env["LC_ALL"] == "C"
+    # must not clobber a user's core.sshCommand
+    assert env.get("GIT_SSH_COMMAND") == os.environ.get("GIT_SSH_COMMAND")
+
+
+async def test_run_git_missing_git_raises_giterror(monkeypatch, tmp_path):
+    from githerd.runner import GitError
+
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    with pytest.raises(GitError, match="git executable not found"):
+        await run_git(tmp_path, "status")

@@ -63,7 +63,7 @@ async def run_bulk(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # one repo failing must not stop the others
-                outcome = Failed(message=str(exc))
+                outcome = Failed(message=str(exc) or type(exc).__name__)
             emit(RepoEvent(repo=str(repo), kind="done", outcome=outcome))
             return repo, outcome
 
@@ -97,5 +97,5 @@ async def pull_repos(
         ]
         try:
             Journal(root).record(f"pull {len(repos)} repos", entries)
-        except OSError:
+        except Exception:  # journaling must never turn a finished pull into a crash
             log.exception("failed to write journal for pull of %d repos", len(repos))
