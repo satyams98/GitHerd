@@ -42,7 +42,9 @@ def redact_url(url: str) -> str:
     try:
         parts = urlsplit(url)
         if "@" not in parts.netloc:
-            return url
+            # An '@' elsewhere means userinfo containing an unescaped '/', '?' or '#'
+            # ended the netloc early: ambiguous, so fail closed.
+            return "" if "@" in url else url
         host = parts.netloc.rsplit("@", 1)[1]
         return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
     except ValueError:

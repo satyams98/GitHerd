@@ -1,6 +1,7 @@
 import pytest
 
-from githerd.gitops import classify_failure, fetch, pull
+import githerd.gitops
+from githerd.gitops import _remote_url, classify_failure, fetch, pull
 from githerd.outcomes import (
     AuthRequired, BlockedDirty, Diverged, Failed, NetworkError, Ok, UpToDate,
 )
@@ -124,3 +125,48 @@ async def test_outcome_never_contains_url_credentials(operation, make_repo, git)
         "https://user:ghp_SECRETTOKEN@127.0.0.1:1/o/r.git")
     outcome = await operation(repo)
     assert "ghp_SECRETTOKEN" not in outcome.model_dump_json()
+
+
+@pytest.mark.parametrize("url", [
+    "https://user:pa/ss_SECRET@host/x",
+    "https://user:pa#ss_SECRET@host/x",
+    "https://user:pa?ss_SECRET@host/x",
+])
+def test_redact_url_fails_closed_on_ambiguous_userinfo(url):
+    from githerd.gitops import redact_url
+
+    result = redact_url(url)
+    assert "ss_SECRET" not in result
+    assert result == ""
+
+
+_TOKEN_URL = "https://user:ghp_SECRETTOKEN@127.0.0.1:1/o/r.git"
+_REDACTED_URL = "https://127.0.0.1:1/o/r.git"
+
+
+async def test_remote_url_redacts_configured_credentials(make_repo, git):
+    repo = make_repo("a")
+    git(repo, "config", "remote.origin.url", _TOKEN_URL)
+    remote = await _remote_url(repo, "origin/main")
+    assert remote == _REDACTED_URL
+    assert "ghp_SECRETTOKEN" not in remote
+
+
+@pytest.mark.parametrize("operation", [pull, fetch])
+async def test_failure_path_passes_redacted_remote_to_classify_failure(
+    operation, make_repo, git, monkeypatch
+):
+    repo = make_repo("a")
+    git(repo, "config", "remote.origin.url", _TOKEN_URL)
+    captured = []
+    real = githerd.gitops.classify_failure
+
+    def recorder(stderr, remote=""):
+        captured.append(remote)
+        return real(stderr, remote)
+
+    monkeypatch.setattr(githerd.gitops, "classify_failure", recorder)
+    await operation(repo)
+    assert captured, "classify_failure was never reached"
+    assert all("ghp_SECRETTOKEN" not in r for r in captured)
+    assert captured == [_REDACTED_URL]
