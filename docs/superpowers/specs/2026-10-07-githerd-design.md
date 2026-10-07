@@ -13,7 +13,8 @@ A Windows terminal tool. Opened in a directory, it discovers every git repo bene
 - Windows only (Windows Terminal; `cmd.exe` best-effort).
 - Python. Typer (CLI), Textual (TUI), asyncio, pydantic, `keyring`.
 - LLM access through two official SDKs behind one neutral interface: `openai` (covers NVIDIA build, OpenRouter, Ollama, OpenAI and any OpenAI-compatible endpoint via `base_url`) and `anthropic` (Claude). No other code imports either SDK.
-- Install via `uv tool install` / `pipx`; PyInstaller `.exe` is a later option.
+- Package `githerd`; entry points `githerd` and short alias `gherd` (not bare `herd`, which Laravel Herd uses on Windows). Tagline: "Herd all your git repos with plain English."
+- Install via `uv tool install githerd` / `pipx`; PyInstaller `.exe` is a later option.
 
 ### v1 features
 **Sync and status**
