@@ -136,6 +136,49 @@ The model sees compact summaries (e.g. `5 Ok, 1 UpToDate, 1 BlockedDirty(infra: 
 - `ui`: Textual pilot harness driven by synthetic progress events.
 - One optional, manually run integration test against the real NVIDIA endpoint.
 
-## 10. Open items
+## 10. UI/UX
+
+The UI is the product. It must look clean and intentional in a terminal.
+
+### Rendering model: inline flow
+- Behaves like a normal CLI session: header, prompt, responses scroll in the terminal's own scrollback.
+- Live regions (the parallel dashboard, progress, spinners) update in place while work runs, then collapse into a static summary left in scrollback (selectable, copyable).
+- Cards expand inline beneath the relevant row.
+- Only the diff viewer goes full-screen (`d` opens, `q` returns to the flow).
+- Implementation: spike Textual inline mode on Windows Terminal first. Fallback: `rich` (Live) for rendering plus `prompt_toolkit` for input, with the diff viewer as a `rich`/`prompt_toolkit` full-screen pager. The spike is the first UI task; the choice is made on real behaviour (flicker, resize, scrollback, input handling), not preference.
+- The UI layer renders from `Outcome` and progress events only (see §5), so swapping the renderer does not touch other units.
+
+### Principles
+1. Calm by default: mostly neutral text, one accent color for interactive elements. Green/amber/red reserved for status only.
+2. Glyphs, not emoji: `✓` ok, `!` needs attention, `✕` failed, `◌` running, `·` queued/idle, `↓` incoming, `↑` outgoing, `●` dirty, `›` prompt. Consistent set; no emoji.
+3. Alignment: fixed columns (name, branch, status, detail); truncate with `…`, never wrap rows.
+4. Hierarchy by weight: bold for the subject, dim for metadata and commands, normal for content.
+5. The real git command is shown quietly (dim) beneath each action's result.
+6. Progressive disclosure: summary, then files, then diff. Nothing shown before it is relevant.
+7. A one-line key-hint bar is always shown when input is expected (e.g. `d diff · s stash · c commit · k skip`).
+8. Motion only while working; finished work is static.
+9. Respect the terminal: truecolor with 16-color fallback, honour `NO_COLOR`, adapt layout from 80 to 200+ columns, degrade to plain text when stdout is not a TTY.
+
+### Palette (semantic tokens, not hard-coded colors)
+`accent`, `ok`, `warn`, `error`, `dim`, `fg`. Defined once in a theme module with dark and light variants chosen from the terminal background where detectable.
+
+### Screens and components
+- **Header:** one line: app name, working directory, repo count, active model.
+- **Prompt:** `›` with history and tab-completion of repo names and branches.
+- **Live dashboard:** header line with overall `n/total` bar; one row per repo (glyph, name, branch, status/progress, elapsed); the command line in dim at the end.
+- **Static summary:** the collapsed dashboard plus a plain-English sentence from the agent.
+- **Cards:** attached beneath the row they concern; show the facts (file list with M/A/D/?? status), then the key-hint bar.
+- **Diff viewer (full-screen):** file list on the left when width allows, syntax-highlighted diff on the right, unified view on narrow terminals; `j/k` scroll, `n/p` next/previous file, `q` quit.
+- **Confirmation prompt (destructive only):** names the exact command and repos affected and requires typing `y` explicitly; the default is No.
+- **Commit-draft box:** the proposed message in an editable box with `↵ accept · e edit · r regenerate · esc cancel`.
+- **Undo notice:** after any mutation, a dim line `undo available: "undo that"`.
+
+### Behavioural rules
+- Never block the prompt on cosmetic work; rendering must keep up with 7+ concurrent repos without flicker (rate-limit redraws).
+- Resize mid-run re-flows the live block without corrupting scrollback.
+- Ctrl+C cancels in-flight operations cleanly (git subprocesses terminated, partial results reported) and returns to the prompt; a second Ctrl+C exits.
+
+## 11. Open items
 - Which NVIDIA-hosted model gives the most reliable tool calling (resolved by a spike at the start of implementation).
+- Textual inline mode vs `rich` + `prompt_toolkit` (resolved by the UI spike, §10).
 - Exact default for dashboard concurrency (5 assumed; tune with real use).
