@@ -1,5 +1,8 @@
 import asyncio
 
+import pytest
+
+from githerd import bulk
 from githerd.bulk import RepoEvent, pull_repos, run_bulk
 from githerd.journal import Journal
 from githerd.outcomes import Failed, Ok, UpToDate
@@ -52,7 +55,7 @@ async def test_run_bulk_emits_start_progress_done(tmp_path):
     assert events[0].repo == str(repo)
 
 
-async def test_pull_repos_pulls_in_parallel_and_journals(make_repo, push_upstream, git, tmp_path):
+async def test_pull_repos_pulls_in_parallel_and_journals(make_repo, push_upstream, tmp_path):
     root = tmp_path / "work"
     a, b, c = make_repo("a"), make_repo("b"), make_repo("c")
     push_upstream(a, "a.txt")
@@ -73,3 +76,81 @@ async def test_pull_repos_without_changes_writes_no_journal(make_repo, tmp_path)
     repo = make_repo("a")
     await pull_repos(root, [repo])
     assert Journal(root).last_undoable() is None
+
+
+def _raising_cb(event):
+    raise RuntimeError("callback boom")
+
+
+async def test_run_bulk_survives_raising_callback(tmp_path):
+    good, other = tmp_path / "good", tmp_path / "other"
+
+    async def op(repo, progress):
+        progress("Receiving objects:  50% (1/2)")
+        if repo == good:
+            return UpToDate()
+        return Ok(commits=1, files=1, before_head="a" * 40, after_head="b" * 40)
+
+    results = await run_bulk([good, other], op, on_event=_raising_cb)
+    assert results[good] == UpToDate()
+    assert isinstance(results[other], Ok)
+    assert not any(isinstance(o, Failed) for o in results.values())
+
+
+async def test_pull_repos_journals_despite_raising_callback(make_repo, push_upstream, tmp_path):
+    root = tmp_path / "work"
+    a, c = make_repo("a"), make_repo("c")
+    push_upstream(a, "a.txt")
+    results = await pull_repos(root, [a, c], on_event=_raising_cb)
+    assert isinstance(results[a], Ok)
+    assert results[c] == UpToDate()
+    op_set = Journal(root).last_undoable()
+    assert op_set is not None
+    assert [e.repo for e in op_set.entries] == [str(a)]
+
+
+async def test_pull_repos_journals_completed_repos_on_cancel(monkeypatch, tmp_path):
+    root = tmp_path / "work"
+    root.mkdir()
+    a, b = tmp_path / "a", tmp_path / "b"
+    a_done = asyncio.Event()
+
+    async def fake_pull(repo, progress):
+        if repo == a:
+            return Ok(commits=1, files=1, before_head="a" * 40, after_head="b" * 40)
+        await asyncio.Event().wait()
+
+    def on_event(event):
+        if event.kind == "done" and event.repo == str(a):
+            a_done.set()
+
+    monkeypatch.setattr(bulk, "pull", fake_pull)
+    task = asyncio.create_task(pull_repos(root, [a, b], on_event=on_event))
+    await asyncio.wait_for(a_done.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    op_set = Journal(root).last_undoable()
+    assert op_set is not None
+    assert [e.repo for e in op_set.entries] == [str(a)]
+
+
+async def test_pull_repos_survives_journal_write_error(monkeypatch, make_repo, push_upstream, tmp_path):
+    root = tmp_path / "work"
+    a = make_repo("a")
+    push_upstream(a, "a.txt")
+
+    def boom(self, description, entries):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(bulk.Journal, "record", boom)
+    results = await pull_repos(root, [a])
+    assert isinstance(results[a], Ok)
+
+
+async def test_run_bulk_rejects_non_positive_concurrency(tmp_path):
+    async def op(repo, progress):
+        return UpToDate()
+
+    with pytest.raises(ValueError):
+        await asyncio.wait_for(run_bulk([tmp_path / "r"], op, concurrency=0), timeout=5)
