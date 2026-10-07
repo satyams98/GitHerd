@@ -80,6 +80,13 @@ Goal: swapping provider or model is a config change; no agent, tool or UI code c
 - **Adapters:**
   - `OpenAIClient(base_url, api_key, model)` uses the `openai` SDK Chat Completions with function calling. Used for NVIDIA, OpenRouter, Ollama, OpenAI.
   - `AnthropicClient(api_key, model)` uses the `anthropic` SDK Messages API with tool use, translating neutral messages (system prompt, `tool_use`/`tool_result` blocks) to and from Anthropic's shape.
+- **Provider presets** (`llm/presets.py`), each just a default `provider` + `base_url` + key requirement, resolved to an adapter by the factory:
+  - `nvidia`: `openai-compatible`, `https://integrate.api.nvidia.com/v1`, key required (free tier). Default.
+  - `ollama`: `openai-compatible`, `http://localhost:11434/v1` (host configurable for a remote Ollama), **no key**. The wizard detects a running Ollama (`GET /api/tags`), lists installed models to pick from, and reports "Ollama not running" with a hint if unreachable.
+  - `openai`, `openrouter`: `openai-compatible` with their base URLs, key required.
+  - `anthropic`: Claude via the `anthropic` SDK, key required.
+  - `custom`: any OpenAI-compatible `base_url` + optional key.
+- Local models vary in tool-calling quality. The adapter reports `supports_tools`; when a chosen Ollama model lacks it, gitai warns at setup and falls back to a constrained mode (plain-text intent parsing into the same tools) rather than failing. Running locally also means diffs never leave the machine, so the commit-draft privacy notice is skipped for `ollama`.
 - **Factory** (`llm/factory.py`): `build_client(config.llm) -> LLMClient`, chosen by `provider` in config (`openai-compatible` or `anthropic`). Model name is a free string passed through; nothing branches on model name.
 - **Capability flags** on the client (`supports_tools`, `supports_streaming`) so the agent can degrade (e.g. no tools: plain-text fallback with a clear message) instead of special-casing models.
 - **Error mapping:** each adapter maps SDK exceptions to neutral `LLMAuthError`, `LLMRateLimitError`, `LLMTimeoutError`, `LLMError`, which is all the agent and UI handle.
@@ -138,7 +145,7 @@ The model sees compact summaries (e.g. `5 Ok, 1 UpToDate, 1 BlockedDirty(infra: 
 
 ## 8. Config and first run
 
-- First-run wizard: choose NVIDIA free tier or own provider, paste key, pick model, verify with a test call.
+- First-run wizard: choose a preset (NVIDIA free tier, local Ollama, OpenAI, OpenRouter, Anthropic, custom), paste key if the preset needs one, pick model (Ollama: from detected installed models), verify with a test call.
 - Config at `%APPDATA%\gitai\config.toml`; key in Credential Manager, never in the file.
 - Settings: concurrency, diff size cap, repo-discovery ignore globs, privacy-notice acknowledgement.
 - `gitai config` to change provider later.
