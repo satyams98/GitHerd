@@ -39,3 +39,58 @@ R, M, D = Tier.READ, Tier.MUTATE, Tier.DESTRUCTIVE
 ])
 def test_classify(args, tier):
     assert classify(args) is tier
+
+
+@pytest.mark.parametrize("args,tier", [
+    # long-option abbreviations (git accepts any unambiguous prefix)
+    (["reset", "--ha"], D), (["reset", "--hard"], D),
+    (["push", "--force-with"], D), (["push", "--force-w", "origin", "main"], D),
+    (["push", "--dele", "origin", "x"], D), (["push", "--mirr"], D),
+    (["pull", "--reb"], D), (["switch", "--disc", "x"], D),
+    (["switch", "--force-c", "y"], D), (["checkout", "--for", "x"], D),
+    (["tag", "--forc", "v1"], D), (["tag", "--delet", "v1"], D),
+    (["restore", "--staged", "--work", "a.txt"], D),
+    # abbreviations must never lower severity
+    (["restore", "--stag", "a.txt"], D), (["branch", "--lis"], R),
+    # checkout of paths without `--`
+    (["checkout", "a.txt"], D), (["checkout", "HEAD", "a.txt"], D),
+    (["checkout", "src/"], D), (["checkout", "./"], D), (["checkout", "*"], D),
+    (["checkout", ":/"], D), (["checkout", "--ours", "a.txt"], D),
+    (["checkout", "-p"], D), (["checkout"], D),
+    (["checkout", "main"], M), (["checkout", "-b", "x"], M),
+    (["checkout", "-b", "x", "origin/main"], M), (["checkout", "-c", "x"], M),
+    # documented accepted false positive: slashed branch names need confirmation
+    (["checkout", "feature/x"], D),
+    # fetch is conditional
+    (["fetch"], R), (["fetch", "--all"], R), (["fetch", "origin"], R),
+    (["fetch", "origin", "main"], R),
+    (["fetch", "origin", "+main:main"], D), (["fetch", "origin", "main:main"], D),
+    (["fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*"], D),
+    (["fetch", "-f"], D), (["fetch", "--force"], D), (["fetch", "-p"], D),
+    (["fetch", "--prune"], D), (["fetch", "--prune-tags"], D),
+    (["fetch", "--update-head-ok"], D), (["fetch", "-u"], D),
+    (["fetch", "--upload-pack=evil", "origin"], D), (["fetch", "--refmap=x"], D),
+    (["fetch", "--prun"], D), (["fetch", "--upload", "x", "origin"], D),
+    (["pull", "origin", "+a:b"], D), (["pull", "origin", "a:b"], D),
+    (["pull", "origin", "main"], M),
+    # global options allowlist
+    (["-c", "core.fsmonitor=CMD", "status"], D),
+    (["-c", "core.sshCommand=CMD", "fetch"], D),
+    (["-c", "pull.rebase=true", "pull"], D),
+    (["--exec-path=/evil", "fetch"], D),
+    (["--attr-source", "status", "push", "--force"], D),
+    (["--config-env=a=B", "status"], D), (["--namespace=x", "status"], D),
+    (["-C", "x", "diff"], R), (["--no-pager", "log"], R),
+    (["--git-dir=.git", "status"], R), (["--git-dir", ".git", "status"], R),
+    (["--work-tree=.", "status"], R), (["--work-tree", ".", "status"], R),
+    (["--no-optional-locks", "status"], R), (["--no-replace-objects", "log"], R),
+    (["--literal-pathspecs", "status"], R),
+    (["-C", "x", "--no-pager", "push", "--force"], D),
+    # minor hardening
+    (["branch", "-C", "a", "b"], D),
+    (["merge", "--abort"], D), (["merge", "--abo"], D),
+    (["cherry-pick", "--abort"], D), (["revert", "--abort"], D),
+    (["merge", "dev"], M), (["cherry-pick", "abc"], M), (["revert", "abc"], M),
+])
+def test_classify_bypass_attempts(args, tier):
+    assert classify(args) is tier
