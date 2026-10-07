@@ -94,3 +94,55 @@ def test_classify(args, tier):
 ])
 def test_classify_bypass_attempts(args, tier):
     assert classify(args) is tier
+
+
+@pytest.mark.parametrize("args,tier", [
+    # command-execution options
+    (["ls-remote", "--upload-pack=evil", "."], D),
+    (["ls-remote", "--upload-pack", "evil", "."], D),
+    (["ls-remote", "--uplo=evil", "."], D),
+    (["ls-remote", "--exec=evil", "."], D),
+    (["push", "--receive-pack=evil", "origin"], D),
+    (["push", "--recei=evil", "origin"], D),
+    (["push", "--exec=evil", "origin"], D),
+    (["pull", "--upload-pack=evil"], D),
+    (["pull", "--receive-pack=evil"], D),
+    (["pull", "--exec=evil"], D),
+    (["fetch", "--receive-pack=evil", "origin"], D),
+    (["fetch", "--exec=evil", "origin"], D),
+    (["clone", "--upload-pack=evil", "url"], D),
+    (["clone", "--uplo=evil", "url"], D),
+    (["clone", "--receive-pack=evil", "url"], D),
+    (["clone", "--exec=evil", "url"], D),
+    (["clone", "-u", "evil", "url"], D),
+    (["clone", "-c", "core.sshCommand=evil", "url"], D),
+    (["clone", "--config", "core.sshCommand=evil", "url"], D),
+    (["clone", "--conf=core.sshCommand=evil", "url"], D),
+    (["clone", "--template=/evil", "url"], D),
+    (["clone", "--templ=/evil", "url"], D),
+    # grep pager
+    (["grep", "-O", "x"], D), (["grep", "-Osh", "x"], D), (["grep", "-nOe", "x"], D),
+    (["grep", "--open-files-in-pager=evil", "x"], D),
+    (["grep", "--open-files", "x"], D),
+    # file-writing options on read commands
+    (["diff", "--output=a.txt"], D), (["diff", "--outp=a.txt"], D),
+    (["diff", "--output", "a.txt"], D),
+    (["log", "--output=a.txt"], D), (["log", "--outp=a.txt"], D),
+    (["show", "--output=a.txt"], D), (["show", "--outp=a.txt", "HEAD"], D),
+    # pull parity with fetch
+    (["pull", "-f"], D), (["pull", "--force"], D), (["pull", "--forc"], D),
+    (["pull", "--prune"], D), (["pull", "--prun"], D), (["pull", "-p"], D),
+    # remote update
+    (["remote", "update", "--prune"], D), (["remote", "update", "--prun"], D),
+    (["remote", "update", "-p"], D), (["remote", "-v", "update", "-p"], D),
+    (["remote", "update"], R), (["remote", "update", "origin"], R),
+    # must stay at their current tier
+    (["ls-remote"], R), (["ls-remote", "origin"], R),
+    (["clone", "url", "dir"], M), (["clone", "--depth", "1", "url"], M),
+    (["grep", "-n", "foo"], R), (["grep", "--only-matching", "foo"], R),
+    (["diff", "HEAD~1"], R), (["diff", "--stat"], R),
+    (["log", "--oneline"], R), (["show", "HEAD"], R),
+    (["pull", "--ff-only"], M), (["push", "origin", "main"], M),
+])
+def test_classify_exec_and_write_options(args, tier):
+    assert classify(args) is tier

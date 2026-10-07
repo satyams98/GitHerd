@@ -77,13 +77,17 @@ def _is_refspec(arg: str) -> bool:
     return arg.startswith("+") or ":" in arg
 
 
+# Options that make git run an arbitrary program (transport helpers).
+_EXEC_OPTS = ("--upload-pack", "--receive-pack", "--exec")
+
+
 Handler = Callable[[set[str], list[str], list[str]], Tier]
 
 
 def _push(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
     if (
         _abbr(flags, "--force", "--force-with-lease", "--force-if-includes",
-              "--mirror", "--delete", "--prune")
+              "--mirror", "--delete", "--prune", *_EXEC_OPTS)
         or _short(flags, "fd")
         or any(p.startswith(("+", ":")) for p in positional)
     ):
@@ -93,8 +97,8 @@ def _push(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
 
 def _pull(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
     if (
-        _abbr(flags, "--rebase")
-        or _short(flags, "r")
+        _abbr(flags, "--rebase", "--force", "--prune", *_EXEC_OPTS)
+        or _short(flags, "rfp")
         or any(_is_refspec(p) for p in positional)
     ):
         return DESTRUCTIVE
@@ -104,12 +108,36 @@ def _pull(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
 def _fetch(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
     if (
         _abbr(flags, "--force", "--prune", "--prune-tags", "--update-head-ok",
-              "--upload-pack", "--refmap")
+              "--refmap", *_EXEC_OPTS)
         or _short(flags, "fpuP")
         or any(_is_refspec(p) for p in positional)
     ):
         return DESTRUCTIVE
     return READ
+
+
+def _ls_remote(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
+    return DESTRUCTIVE if _abbr(flags, *_EXEC_OPTS) else READ
+
+
+def _clone(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
+    if (
+        _abbr(flags, "--config", "--template", *_EXEC_OPTS)
+        or _short(flags, "uc")
+    ):
+        return DESTRUCTIVE
+    return MUTATE
+
+
+def _grep(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
+    if _abbr(flags, "--open-files-in-pager") or _short(flags, "O"):
+        return DESTRUCTIVE
+    return READ
+
+
+def _writes_output(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
+    """diff/log/show: `--output=<file>` writes (clobbers) a file."""
+    return DESTRUCTIVE if _abbr(flags, "--output") else READ
 
 
 def _abortable(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
@@ -153,7 +181,9 @@ def _stash(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
 
 
 def _remote(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
-    if not positional or positional[0] in {"show", "get-url", "update"}:
+    if positional and positional[0] == "update":
+        return DESTRUCTIVE if _abbr(flags, "--prune") or _short(flags, "p") else READ
+    if not positional or positional[0] in {"show", "get-url"}:
         return READ
     if positional[0] in {"add", "rename", "set-url", "set-head", "set-branches"}:
         return MUTATE
@@ -185,9 +215,12 @@ def _checkout(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
         or "." in positional
     ):
         return DESTRUCTIVE
-    # Without `--`, git cannot be told apart from a path restore, so only the
-    # unambiguous branch forms are MUTATE: `checkout <plain-ref>` and
-    # `checkout -b/-c <name> [start]`. Everything else needs confirmation.
+    # KNOWN RESIDUAL false negative: without `--`, `checkout <plain-ref>` is
+    # ambiguous with a file restore (e.g. `checkout Makefile` discards local
+    # changes to Makefile) and is classified MUTATE, because `checkout main` must
+    # stay MUTATE. The real mitigation is that githerd's tool layer only emits
+    # `switch` for branch changes, never `checkout <ref>`. Everything else
+    # (paths, globs, dots, slashes, extra args) needs confirmation.
     if not flags and len(positional) == 1 and _PLAIN_REF.fullmatch(positional[0]):
         return MUTATE
     if flags and flags <= {"-b", "-c"} and 1 <= len(positional) <= 2:
@@ -205,6 +238,8 @@ _HANDLERS: dict[str, Handler] = {
     "push": _push, "pull": _pull, "fetch": _fetch, "branch": _branch, "tag": _tag,
     "stash": _stash, "remote": _remote, "reflog": _reflog, "reset": _reset,
     "restore": _restore, "checkout": _checkout, "switch": _switch,
+    "ls-remote": _ls_remote, "clone": _clone, "grep": _grep,
+    "diff": _writes_output, "log": _writes_output, "show": _writes_output,
     "merge": _abortable, "cherry-pick": _abortable, "revert": _abortable,
 }
 
