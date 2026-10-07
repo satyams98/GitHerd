@@ -77,8 +77,12 @@ def _is_refspec(arg: str) -> bool:
     return arg.startswith("+") or ":" in arg
 
 
-# Options that make git run an arbitrary program (transport helpers).
-_EXEC_OPTS = ("--upload-pack", "--receive-pack", "--exec")
+# Long options that make git run an arbitrary program (transport helpers, pagers)
+# or write a file. Checked for EVERY subcommand in classify(), abbreviation-aware,
+# before any handler or READ/MUTATE set is consulted.
+_DANGEROUS_OPTS = (
+    "--output", "--upload-pack", "--receive-pack", "--exec", "--open-files-in-pager",
+)
 
 
 Handler = Callable[[set[str], list[str], list[str]], Tier]
@@ -87,7 +91,7 @@ Handler = Callable[[set[str], list[str], list[str]], Tier]
 def _push(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
     if (
         _abbr(flags, "--force", "--force-with-lease", "--force-if-includes",
-              "--mirror", "--delete", "--prune", *_EXEC_OPTS)
+              "--mirror", "--delete", "--prune")
         or _short(flags, "fd")
         or any(p.startswith(("+", ":")) for p in positional)
     ):
@@ -97,7 +101,7 @@ def _push(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
 
 def _pull(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
     if (
-        _abbr(flags, "--rebase", "--force", "--prune", *_EXEC_OPTS)
+        _abbr(flags, "--rebase", "--force", "--prune")
         or _short(flags, "rfp")
         or any(_is_refspec(p) for p in positional)
     ):
@@ -108,7 +112,7 @@ def _pull(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
 def _fetch(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
     if (
         _abbr(flags, "--force", "--prune", "--prune-tags", "--update-head-ok",
-              "--refmap", *_EXEC_OPTS)
+              "--refmap")
         or _short(flags, "fpuP")
         or any(_is_refspec(p) for p in positional)
     ):
@@ -116,28 +120,16 @@ def _fetch(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
     return READ
 
 
-def _ls_remote(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
-    return DESTRUCTIVE if _abbr(flags, *_EXEC_OPTS) else READ
-
-
 def _clone(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
-    if (
-        _abbr(flags, "--config", "--template", *_EXEC_OPTS)
-        or _short(flags, "uc")
-    ):
+    if _abbr(flags, "--config", "--template") or _short(flags, "uc"):
         return DESTRUCTIVE
     return MUTATE
 
 
 def _grep(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
-    if _abbr(flags, "--open-files-in-pager") or _short(flags, "O"):
+    if _short(flags, "O"):  # long form is covered by _DANGEROUS_OPTS
         return DESTRUCTIVE
     return READ
-
-
-def _writes_output(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
-    """diff/log/show: `--output=<file>` writes (clobbers) a file."""
-    return DESTRUCTIVE if _abbr(flags, "--output") else READ
 
 
 def _abortable(flags: set[str], positional: list[str], rest: list[str]) -> Tier:
@@ -238,8 +230,7 @@ _HANDLERS: dict[str, Handler] = {
     "push": _push, "pull": _pull, "fetch": _fetch, "branch": _branch, "tag": _tag,
     "stash": _stash, "remote": _remote, "reflog": _reflog, "reset": _reset,
     "restore": _restore, "checkout": _checkout, "switch": _switch,
-    "ls-remote": _ls_remote, "clone": _clone, "grep": _grep,
-    "diff": _writes_output, "log": _writes_output, "show": _writes_output,
+    "clone": _clone, "grep": _grep,
     "merge": _abortable, "cherry-pick": _abortable, "revert": _abortable,
 }
 
@@ -251,6 +242,8 @@ def classify(args: Sequence[str]) -> Tier:
         return DESTRUCTIVE
     flags = {a for a in rest if a.startswith("-") and a != "--"}
     positional = [a for a in rest if not a.startswith("-")]
+    if _abbr(flags, *_DANGEROUS_OPTS):
+        return DESTRUCTIVE
     handler = _HANDLERS.get(sub)
     if handler:
         return handler(flags, positional, rest)

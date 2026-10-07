@@ -146,3 +146,31 @@ def test_classify_bypass_attempts(args, tier):
 ])
 def test_classify_exec_and_write_options(args, tier):
     assert classify(args) is tier
+
+
+@pytest.mark.parametrize("args,tier", [
+    # exec / file-write options are dangerous on ANY subcommand
+    (["stash", "show", "--output=a.txt"], D),
+    (["stash", "show", "-p", "--output", "a"], D),
+    (["reflog", "show", "--output=a"], D),
+    (["reflog", "--output=a"], D),
+    (["rev-list", "--output=a", "HEAD"], D),
+    (["shortlog", "--output=x"], D),
+    (["blame", "--output=x", "f"], D),
+    (["status", "--exec=evil"], D),
+    (["log", "--outp=a"], D),
+    (["branch", "--upload-pack=x"], D),
+    (["tag", "--receive-pack=x"], D),
+    (["cat-file", "--open-files-in-pager=x"], D),
+    (["-C", "x", "status", "--output=a"], D),
+    # short flags that exec / configure remain covered by their handlers
+    (["clone", "-uevil", "url"], D),
+    (["clone", "-ccore.sshCommand=evil", "url"], D),
+    (["grep", "-Oevil", "x"], D),
+    # non-regression
+    (["log", "--oneline"], R), (["diff", "--stat"], R), (["status", "--short"], R),
+    (["stash", "show"], R), (["reflog"], R),
+    (["pull", "--ff-only"], M), (["push", "origin", "main"], M),
+])
+def test_classify_dangerous_options_any_subcommand(args, tier):
+    assert classify(args) is tier
