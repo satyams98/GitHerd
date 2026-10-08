@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from pydantic import BaseModel
 
@@ -26,7 +26,28 @@ class UndoItem(BaseModel):
     detail: str = ""
 
 
-async def undo_last(root: Path, journal: Journal) -> tuple[OpSet | None, list[UndoItem]]:
+def _confirmed(
+    confirm_moved: Callable[[JournalEntry, str], bool] | None,
+    entry: JournalEntry,
+    current: str,
+) -> bool:
+    """Ask once whether to undo a moved repo; a missing or failing callback means no."""
+    if confirm_moved is None:
+        return False
+    try:
+        return bool(confirm_moved(entry, current))
+    except Exception:
+        # A broken prompt must never crash the undo or stop the other repos.
+        log.exception("confirm_moved failed for %s; treating as declined", entry.repo)
+        return False
+
+
+async def undo_last(
+    root: Path,
+    journal: Journal,
+    *,
+    confirm_moved: Callable[[JournalEntry, str], bool] | None = None,
+) -> tuple[OpSet | None, list[UndoItem]]:
     op_set = journal.last_undoable()
     if op_set is None:
         return None, []
@@ -46,20 +67,23 @@ async def undo_last(root: Path, journal: Journal) -> tuple[OpSet | None, list[Un
             items.append(UndoItem(repo=entry.repo, status="skipped",
                                   detail="repo not found or not a git repository"))
             continue
-        if head_res.stdout.strip() != entry.after_head:
+        current = head_res.stdout.strip()
+        moved = current != entry.after_head
+        if moved and not _confirmed(confirm_moved, entry, current):
             items.append(UndoItem(repo=entry.repo, status="skipped",
                                   detail="repo has moved since this operation; not undone"))
             retryable.append(entry)
             continue
         res = await run_git(repo, *reverse, entry.before_head)
         if res.ok:
+            suffix = " (newer commits dropped)" if moved else ""
             items.append(UndoItem(repo=entry.repo, status="restored",
-                                  detail=f"back to {entry.before_head[:7]}"))
+                                  detail=f"back to {entry.before_head[:7]}{suffix}"))
             restored_any = True
             if entry.op != "undo":  # undoing an undo is terminal; don't journal it again
                 reversals.append(JournalEntry(
                     repo=entry.repo, op="undo",
-                    before_head=entry.after_head, after_head=entry.before_head,
+                    before_head=current, after_head=entry.before_head,
                 ))
         else:
             items.append(UndoItem(repo=entry.repo, status="failed",

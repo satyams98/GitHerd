@@ -201,3 +201,171 @@ async def test_undo_survives_journal_write_error(monkeypatch, make_repo, push_up
     op_set, items = await undo_last(root, journal)
     assert [i.status for i in items] == ["restored"]
     assert git(repo, "rev-parse", "HEAD") == outcome.before_head
+
+
+# ---- undo of a moved repo with confirmation ----
+
+async def test_undo_moved_repo_when_confirmed(make_repo, push_upstream, git, commit_local, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "later.txt")
+    later = git(repo, "rev-parse", "HEAD")
+    asked = []
+
+    def confirm(entry, current):
+        asked.append((entry.repo, current))
+        return True
+
+    _, items = await undo_last(root, journal, confirm_moved=confirm)
+    assert [i.status for i in items] == ["restored"]
+    assert "newer commits dropped" in items[0].detail
+    assert git(repo, "rev-parse", "HEAD") == outcome.before_head
+    assert asked == [(str(repo), later)]
+
+
+async def test_undo_moved_repo_when_declined(make_repo, push_upstream, git, commit_local, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "later.txt")
+    later = git(repo, "rev-parse", "HEAD")
+    _, items = await undo_last(root, journal, confirm_moved=lambda entry, current: False)
+    assert [i.status for i in items] == ["skipped"]
+    assert git(repo, "rev-parse", "HEAD") == later
+
+
+async def test_confirmed_undo_of_moved_repo_can_be_redone(make_repo, push_upstream, git, commit_local, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "later.txt")
+    later = git(repo, "rev-parse", "HEAD")
+    await undo_last(root, journal, confirm_moved=lambda entry, current: True)
+    await undo_last(root, journal)  # redo: moves back to the later commit
+    assert git(repo, "rev-parse", "HEAD") == later
+
+
+async def test_confirm_moved_receives_entry_and_current_head(make_repo, push_upstream, git, commit_local, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "later.txt")
+    later = git(repo, "rev-parse", "HEAD")
+    seen = []
+
+    def confirm(entry, current):
+        seen.append((entry, current))
+        return False
+
+    await undo_last(root, journal, confirm_moved=confirm)
+    assert len(seen) == 1
+    entry, current = seen[0]
+    assert isinstance(entry, JournalEntry)
+    assert (entry.repo, entry.op) == (str(repo), "pull")
+    assert (entry.before_head, entry.after_head) == (outcome.before_head, outcome.after_head)
+    assert current == later != entry.after_head
+
+
+async def test_confirm_moved_asked_once_per_moved_repo_only(make_repo, push_upstream, git, commit_local, tmp_path):
+    a, b, root, journal, results = await _two_pulled(make_repo, push_upstream, tmp_path)
+    commit_local(b, "later.txt")  # only b moves; a's HEAD still matches
+    asked = []
+
+    def confirm(entry, current):
+        asked.append(entry.repo)
+        return True
+
+    _, items = await undo_last(root, journal, confirm_moved=confirm)
+    assert asked == [str(b)]
+    assert {Path(i.repo).name: i.status for i in items} == {"a": "restored", "b": "restored"}
+    assert git(a, "rev-parse", "HEAD") == results[a].before_head
+    assert git(b, "rev-parse", "HEAD") == results[b].before_head
+
+
+async def test_confirm_moved_not_called_when_head_matches(make_repo, push_upstream, git, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    asked = []
+
+    def confirm(entry, current):
+        asked.append(entry.repo)
+        return True
+
+    _, items = await undo_last(root, journal, confirm_moved=confirm)
+    assert asked == []
+    assert [i.status for i in items] == ["restored"]
+    assert "newer commits dropped" not in items[0].detail
+
+
+async def test_raising_confirm_is_treated_as_declined(make_repo, push_upstream, git, commit_local, tmp_path, caplog):
+    a, b, root, journal, results = await _two_pulled(make_repo, push_upstream, tmp_path)
+    commit_local(a, "later.txt")
+    a_later = git(a, "rev-parse", "HEAD")
+
+    def confirm(entry, current):
+        raise RuntimeError("prompt exploded")
+
+    with caplog.at_level("ERROR", logger="githerd.undo"):
+        op_set, items = await undo_last(root, journal, confirm_moved=confirm)
+    assert {Path(i.repo).name: i.status for i in items} == {"a": "skipped", "b": "restored"}
+    assert git(a, "rev-parse", "HEAD") == a_later
+    assert git(b, "rev-parse", "HEAD") == results[b].before_head
+    assert any(r.name == "githerd.undo" and "prompt exploded" in (r.exc_text or "") for r in caplog.records)
+    # still retryable: the moved repo is the residual op set
+    residual = journal.last_undoable()
+    assert residual.description == f"{op_set.description} (not yet undone)"
+    assert [e.repo for e in residual.entries] == [str(a)]
+
+
+async def test_raising_confirm_on_only_repo_leaves_op_set_untouched(make_repo, push_upstream, git, commit_local, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "later.txt")
+    before = journal.last_undoable()
+
+    def confirm(entry, current):
+        raise ValueError("boom")
+
+    _, items = await undo_last(root, journal, confirm_moved=confirm)
+    assert [i.status for i in items] == ["skipped"]
+    assert journal.last_undoable() == before
+
+
+def _undo_opsets(journal):
+    return [ln for ln in journal._lines()
+            if ln["type"] == "opset" and ln["description"].startswith("undo:")]
+
+
+async def test_confirmed_reset_failure_is_failed_retryable_and_not_journaled(make_repo, push_upstream, git, commit_local, tmp_path):
+    a, b, root, journal, results = await _two_pulled(make_repo, push_upstream, tmp_path)
+    commit_local(b, "later.txt")
+    b_later = git(b, "rev-parse", "HEAD")
+    # An uncommitted edit to a file the reversal must change: `reset --keep` refuses.
+    (b / "README.md").write_text("local edit\n", encoding="utf-8")
+
+    op_set, items = await undo_last(root, journal, confirm_moved=lambda entry, current: True)
+    assert {Path(i.repo).name: i.status for i in items} == {"a": "restored", "b": "failed"}
+    assert git(b, "rev-parse", "HEAD") == b_later
+    residual = journal.last_undoable()
+    assert residual.description == f"{op_set.description} (not yet undone)"
+    assert [(e.repo, e.op) for e in residual.entries] == [(str(b), "pull")]
+    # the reversal journaled for this undo covers only the repo that was actually reset
+    undo_sets = _undo_opsets(journal)
+    assert len(undo_sets) == 1
+    assert [e["repo"] for e in undo_sets[0]["entries"]] == [str(a)]
+
+
+async def test_confirmed_reset_failure_on_only_repo_keeps_op_set(make_repo, push_upstream, git, commit_local, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "later.txt")
+    later = git(repo, "rev-parse", "HEAD")
+    (repo / "new.txt").write_text("local edit\n", encoding="utf-8")  # blocks reset --keep
+
+    _, items = await undo_last(root, journal, confirm_moved=lambda entry, current: True)
+    assert [i.status for i in items] == ["failed"]
+    assert git(repo, "rev-parse", "HEAD") == later
+    assert journal.last_undoable().description == "pull 1 repo"
+    assert _undo_opsets(journal) == []
+
+
+async def test_reversal_of_confirmed_moved_undo_records_current_head(make_repo, push_upstream, git, commit_local, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "later.txt")
+    later = git(repo, "rev-parse", "HEAD")
+    await undo_last(root, journal, confirm_moved=lambda entry, current: True)
+    reversal = journal.last_undoable()
+    assert [(e.op, e.before_head, e.after_head) for e in reversal.entries] == [
+        ("undo", later, outcome.before_head)
+    ]
+
