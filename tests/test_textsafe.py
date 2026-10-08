@@ -142,6 +142,29 @@ def test_clean_message_is_idempotent_on_tricky_inputs(text):
     once = clean_message(text)
     assert clean_message(once) == once
     assert "ghp_SECRET" not in once and "p@ss" not in once
+    assert "u:p@" not in once
+
+
+GLUED_URLS = [
+    ("1http://u:pw@h", "pw", "h"),
+    ("-https://u:pw@h", "pw", "h"),
+    (".https://u:pw@h", "pw", "h"),
+    ("+https://u:pw@h", "pw", "h"),
+    ("a" * 40 + "https://u:pw@h", "pw", "h"),
+    ("x" * 1_000_000 + "https://u:pw@h", "pw", "h"),
+    ("_1http://u:SECRET@host/p", "SECRET", "host/p"),
+    ("1ftp://tok:SECRET@host/p", "SECRET", "host/p"),
+    ("t<>=1http://SECRET@host/p", "SECRET", "host/p"),
+]
+
+
+@pytest.mark.parametrize("text, secret, host", GLUED_URLS, ids=lambda v: f"{str(v)[:14]!r}")
+def test_credentials_in_urls_glued_to_preceding_text_are_redacted(text, secret, host):
+    out = clean_message(text)
+    assert secret not in out
+    assert "@" not in out
+    assert out.endswith("://" + host)
+    assert clean_message(out) == out
 
 
 @pytest.mark.parametrize("text", [
@@ -156,6 +179,10 @@ def test_clean_message_is_idempotent_on_tricky_inputs(text):
     "a://" + ":@" * 100_000,
     "a://u:p@" * 30_000,
     "a" * 31 + "://" + "b" * 200_000,
+    ("a" * 31 + "://" + "b" * 30) * 5000,
+    "a" * 400_000,
+    "x" * 1_000_000 + "https://u:pw@h",
+    "1http://" * 50_000,
 ], ids=lambda t: f"{t[:12]!r}x{len(t)}")
 def test_clean_message_runs_in_linear_time(text):
     start = time.perf_counter()

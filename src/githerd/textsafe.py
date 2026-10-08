@@ -38,11 +38,11 @@ _UNSAFE = re.compile(
     "[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]"
 )
 _WHITESPACE_CONTROLS = str.maketrans({c: " " for c in "\t\n\v\f\r"})
-# scheme "://" userinfo "@": the scheme starts at a run boundary (the lookbehind) and is at
-# most 32 characters, and the userinfo stays inside the authority (no "/", "?", "#" or
-# whitespace), so every authority is scanned once and the search is linear in the text.
+# scheme "://" userinfo "@": the scheme is at most 32 characters (no lookbehind, so a URL glued
+# to preceding text is still found; at most 32 attempts per position), and the userinfo stays
+# inside the authority (no "/", "?", "#" or whitespace), so the search is linear in the text.
 _USERINFO = re.compile(
-    r"(?P<scheme>(?<![A-Za-z0-9+.\-])[A-Za-z][A-Za-z0-9+.\-]{0,31})://(?P<userinfo>[^\s/?#]*)@"
+    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]{0,31})://(?P<userinfo>[^\s/?#]*)@"
 )
 _KEEP_BARE_USER = frozenset({"ssh", "git+ssh", "ssh+git"})
 _MAX_REDACT_PASSES = 4
