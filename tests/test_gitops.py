@@ -226,3 +226,77 @@ async def test_pull_blocked_by_non_ascii_path_matches_file_change_path(make_repo
     assert isinstance(outcome, BlockedDirty)
     assert outcome.blocking == [name]
     assert name in [f.path for f in outcome.files]
+
+
+async def test_pull_ok_carries_the_branch_that_was_pulled(make_repo, push_upstream):
+    repo = make_repo("a")
+    push_upstream(repo, "new.txt")
+    outcome = await pull(repo)
+    assert isinstance(outcome, Ok)
+    assert outcome.branch == "main"
+
+
+# ---- H2 item 2: cheap HEAD/branch readers --------------------------------------------
+
+async def test_head_and_branch_on_a_branch(make_repo, git):
+    from githerd.gitops import head_and_branch
+
+    repo = make_repo("a")
+    assert await head_and_branch(repo) == (git(repo, "rev-parse", "HEAD"), "main")
+
+
+async def test_head_and_branch_detached_has_no_branch(make_repo, git):
+    from githerd.gitops import head_and_branch
+
+    repo = make_repo("a")
+    head = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "--detach")
+    assert await head_and_branch(repo) == (head, None)
+
+
+async def test_head_and_branch_is_none_for_unborn_and_missing_repos(tmp_path):
+    import subprocess
+
+    from githerd.gitops import head_and_branch
+
+    unborn = tmp_path / "unborn"
+    subprocess.run(["git", "init", "-b", "main", str(unborn)], check=True, capture_output=True)
+    assert await head_and_branch(unborn) is None
+    assert await head_and_branch(tmp_path / "missing") is None
+
+
+async def test_head_and_branch_spawns_exactly_one_git(monkeypatch, make_repo):
+    from githerd.gitops import head_and_branch
+
+    repo = make_repo("a")
+    calls = []
+    real = githerd.gitops.run_git
+
+    async def spy(path, *args, **kwargs):
+        calls.append(args)
+        return await real(path, *args, **kwargs)
+
+    monkeypatch.setattr(githerd.gitops, "run_git", spy)
+    assert await head_and_branch(repo) is not None
+    assert calls == [("rev-parse", "HEAD", "--abbrev-ref", "HEAD")]
+
+
+def test_head_sync_reads_head_and_never_raises(monkeypatch, tmp_path, make_repo, git):
+    import subprocess
+
+    from githerd.gitops import head_sync
+
+    repo = make_repo("a")
+    assert head_sync(repo) == git(repo, "rev-parse", "HEAD")
+    assert head_sync(tmp_path / "missing") is None
+
+    def hang(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="git", timeout=10)
+
+    def missing_git(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(subprocess, "run", hang)
+    assert head_sync(repo) is None
+    monkeypatch.setattr(subprocess, "run", missing_git)
+    assert head_sync(repo) is None

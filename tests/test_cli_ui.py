@@ -441,3 +441,41 @@ def test_plain_pull_line_for_a_hostile_repo_name_is_clean_and_aligned(monkeypatc
     done = describe(UpToDate())
     lines = [ln for ln in result.output.splitlines() if ln.endswith(done)]
     assert lines == [f"evil?name  {done}", f"{'b':<9}  {done}"]
+
+
+# ---- H2 item 5: the undo confirmation names the branch and the dropped commits -------
+
+def test_interactive_undo_confirmation_names_the_branch_and_one_dropped_commit(
+    make_repo, push_upstream, commit_local, git, monkeypatch, tmp_path
+):
+    console = _terminal(monkeypatch)
+    root = tmp_path / "work"
+    _pulled_and_moved(make_repo, push_upstream, commit_local, git, runner, root)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    result = runner.invoke(app, ["undo", "--root", str(root)])
+    assert result.exit_code == 2, result.output
+    assert "a is on 'main'; 1 newer commit will be dropped from it (kept in the reflog)" in console.export_text()
+
+
+def test_interactive_undo_confirmation_counts_several_dropped_commits(
+    make_repo, push_upstream, commit_local, git, monkeypatch, tmp_path
+):
+    console = _terminal(monkeypatch)
+    root = tmp_path / "work"
+    a, _ = _pulled_and_moved(make_repo, push_upstream, commit_local, git, runner, root)
+    commit_local(a, "mine2.txt")
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    runner.invoke(app, ["undo", "--root", str(root)])
+    assert "a is on 'main'; 2 newer commits will be dropped from it (kept in the reflog)" in console.export_text()
+
+
+def test_interactive_undo_confirmation_says_some_when_the_count_is_unavailable(
+    make_repo, push_upstream, commit_local, git, monkeypatch, tmp_path
+):
+    console = _terminal(monkeypatch)
+    root = tmp_path / "work"
+    _pulled_and_moved(make_repo, push_upstream, commit_local, git, runner, root)
+    monkeypatch.setattr(cli, "git_sync", lambda *args, **kwargs: None)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    runner.invoke(app, ["undo", "--root", str(root)])
+    assert "a is on 'main'; some newer commits will be dropped from it (kept in the reflog)" in console.export_text()

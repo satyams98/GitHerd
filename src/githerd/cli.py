@@ -26,6 +26,7 @@ from rich.text import Text
 
 from githerd.attention import exit_code_for, resolve_attention
 from githerd.bulk import RepoEvent, pull_repos
+from githerd.gitops import git_sync
 from githerd.journal import Journal
 from githerd.outcomes import Ok, Outcome, describe, summarize
 from githerd.repos import discover_repos, snapshot_all
@@ -188,13 +189,21 @@ def undo(root: RootOpt = None) -> None:
     if _interactive(console):
         def confirm(entry, current: str) -> bool:
             name = Path(entry.repo).name
+            repo = Path(entry.repo)
+            branch = entry.branch or git_sync(repo, "rev-parse", "--abbrev-ref", "HEAD") or "?"
+            count = git_sync(repo, "rev-list", "--count", f"{entry.after_head}..{current}")
+            if count is not None and count.isdigit() and int(count) >= 1:
+                dropped = f"{count} newer commit{'' if int(count) == 1 else 's'}"
+            else:
+                dropped = "some newer commits"  # the count is only a courtesy; never block on it
             return confirm_destructive(
                 console,
                 command=f"git reset --keep {entry.before_head[:7]}  ({name})",
                 repos=[name],
                 glyphs=glyphs,
                 read_line=lambda prompt: input(prompt),  # looked up per call, not bound at import
-                detail=f"{name} has newer commits; they are dropped from the branch (kept in the reflog)",
+                detail=(f"{name} is on '{clean_message(branch)}'; {dropped} will be dropped "
+                        "from it (kept in the reflog)"),
             )
 
     options = {"confirm_moved": confirm} if confirm is not None else {}

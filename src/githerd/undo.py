@@ -63,6 +63,12 @@ async def undo_last(
 ) -> tuple[OpSet | None, list[UndoItem]]:
     """Reverse the most recent undoable operation set, repo by repo.
 
+    When an entry records the ``branch`` the operation changed, the repo must still be on
+    that branch (a detached HEAD never matches): otherwise it is skipped without any
+    prompt, stays retryable, and nothing is reset, even if its HEAD still equals
+    ``after_head`` (e.g. a new branch cut at the pulled commit). Entries from old
+    journals have no branch and skip this check.
+
     A repo whose HEAD no longer equals the recorded ``after_head`` has "moved". If it
     simply moved forward on the same history (``after_head`` is an ancestor of HEAD),
     ``confirm_moved(entry, current_head)`` is asked whether to reset it anyway, dropping
@@ -99,12 +105,26 @@ async def undo_last(
         current = head_res.stdout.strip()
         moved = current != entry.after_head
         suffix = ""
-        if moved:
-            if current == entry.before_head:
-                # Already reset there by the user: nothing to undo, nothing to retry.
-                items.append(UndoItem(repo=entry.repo, status="skipped",
-                                      detail=f"already at {current[:7]}"))
+        if moved and current == entry.before_head:
+            # Already reset there by the user: nothing to undo, nothing to retry.
+            items.append(UndoItem(repo=entry.repo, status="skipped",
+                                  detail=f"already at {current[:7]}"))
+            continue
+        if entry.branch is not None:
+            # A branch cut at the pulled commit has the same HEAD but is not what was
+            # pulled: resetting it would move the wrong branch. Never prompt for this.
+            branch_res = await run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+            now_on = branch_res.stdout.strip() if branch_res.ok else ""
+            if now_on != entry.branch:  # detached HEAD reads as "HEAD", never a branch name
+                if now_on:
+                    detail = (f"repo is on branch '{clean_message(now_on)}' but the operation was on "
+                              f"'{clean_message(entry.branch)}'; not undone")
+                else:
+                    detail = "cannot tell which branch the repo is on; not undone"
+                items.append(UndoItem(repo=entry.repo, status="skipped", detail=detail))
+                retryable.append(entry)
                 continue
+        if moved:
             # Exit 1 = not an ancestor; anything else (e.g. object gone after a gc)
             # is equally "can't prove it is the same history".
             ancestry = await run_git(repo, "merge-base", "--is-ancestor",
@@ -128,7 +148,7 @@ async def undo_last(
             if entry.op != "undo":  # undoing an undo is terminal; don't journal it again
                 reversals.append(JournalEntry(
                     repo=entry.repo, op="undo",
-                    before_head=current, after_head=entry.before_head,
+                    before_head=current, after_head=entry.before_head, branch=entry.branch,
                 ))
         else:
             items.append(UndoItem(repo=entry.repo, status="failed",

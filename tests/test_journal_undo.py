@@ -445,7 +445,8 @@ async def test_different_history_is_retryable_residual_next_to_restored_repo(
     by = {Path(i.repo).name: i for i in items}
     assert by["a"].status == "restored"
     assert by["b"].status == "skipped"
-    assert by["b"].detail == DIFFERENT_HISTORY
+    # the pull journaled branch "main" and b switched to "other": the branch check comes first
+    assert by["b"].detail == "repo is on branch 'other' but the operation was on 'main'; not undone"
     residual = journal.last_undoable()
     assert residual.description == f"{op_set.description} (not yet undone)"
     assert [e.repo for e in residual.entries] == [str(b)]
@@ -555,3 +556,148 @@ async def test_closing_a_permanent_skip_op_set_survives_a_journal_write_error(mo
     monkeypatch.setattr(Journal, "mark_undone", boom)
     _, items = await undo_last(tmp_path, journal)
     assert [i.status for i in items] == ["skipped"]
+
+
+# ---- H2 item 1: the journal records the branch --------------------------------------
+
+def test_journal_entry_without_branch_loads_from_an_old_line(tmp_path):
+    import json
+
+    journal = Journal(tmp_path)
+    journal.dir.mkdir(parents=True)
+    old = {"type": "opset", "id": "abc12345", "timestamp": "2026-01-01T00:00:00+00:00",
+           "description": "old pull", "entries": [
+               {"repo": "r", "op": "pull", "before_head": "a", "after_head": "b"}]}
+    journal.path.write_text(json.dumps(old) + "\n", encoding="utf-8")
+    op_set = journal.last_undoable()
+    assert op_set is not None
+    assert op_set.entries[0].branch is None
+
+
+def test_journal_entry_branch_round_trips(tmp_path):
+    journal = Journal(tmp_path)
+    journal.record("x", [JournalEntry(repo="r", op="pull", before_head="a", after_head="b", branch="main")])
+    assert journal.last_undoable().entries[0].branch == "main"
+
+
+# ---- H2 item 4: undo refuses a different branch --------------------------------------
+
+async def _pulled_on_branch(make_repo, push_upstream, git, tmp_path):
+    """Like _pulled, but the journal entry records the branch (as a real pull now does)."""
+    repo = make_repo("a")
+    push_upstream(repo, "new.txt")
+    outcome = await pull(repo)
+    assert isinstance(outcome, Ok) and outcome.branch == "main"
+    root = tmp_path / "work"
+    journal = Journal(root)
+    journal.record("pull 1 repo", [JournalEntry(
+        repo=str(repo), op="pull", before_head=outcome.before_head,
+        after_head=outcome.after_head, branch=outcome.branch,
+    )])
+    return repo, root, journal, outcome
+
+
+def _branch_detail(current, recorded):
+    return f"repo is on branch '{current}' but the operation was on '{recorded}'; not undone"
+
+
+async def test_undo_on_a_different_branch_at_the_same_head_is_skipped_without_prompt(
+    make_repo, push_upstream, git, tmp_path
+):
+    repo, root, journal, outcome = await _pulled_on_branch(make_repo, push_upstream, git, tmp_path)
+    git(repo, "switch", "-c", "feature")  # cut at the pulled commit: same head, other branch
+    before = journal.last_undoable()
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [(i.status, i.detail) for i in items] == [("skipped", _branch_detail("feature", "main"))]
+    assert git(repo, "rev-parse", "HEAD") == outcome.after_head  # nothing was reset
+    assert journal.last_undoable() == before  # still retryable
+
+
+async def test_undo_on_a_different_branch_that_also_moved_is_skipped_without_prompt(
+    make_repo, push_upstream, git, commit_local, tmp_path
+):
+    repo, root, journal, outcome = await _pulled_on_branch(make_repo, push_upstream, git, tmp_path)
+    git(repo, "switch", "-c", "feature")
+    commit_local(repo, "later.txt")  # same history, moved forward, but on another branch
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [(i.status, i.detail) for i in items] == [("skipped", _branch_detail("feature", "main"))]
+
+
+async def test_undo_on_the_same_branch_is_restored_as_before(make_repo, push_upstream, git, tmp_path):
+    repo, root, journal, outcome = await _pulled_on_branch(make_repo, push_upstream, git, tmp_path)
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [i.status for i in items] == ["restored"]
+    assert git(repo, "rev-parse", "HEAD") == outcome.before_head
+
+
+async def test_undo_on_the_same_branch_that_moved_still_asks(
+    make_repo, push_upstream, git, commit_local, tmp_path
+):
+    repo, root, journal, outcome = await _pulled_on_branch(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "later.txt")
+    asked = []
+    _, items = await undo_last(
+        root, journal, confirm_moved=lambda entry, current: asked.append(entry.branch) or True)
+    assert asked == ["main"]
+    assert [i.status for i in items] == ["restored"]
+
+
+async def test_undo_of_an_old_entry_without_a_branch_ignores_the_branch(
+    make_repo, push_upstream, git, tmp_path
+):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    assert journal.last_undoable().entries[0].branch is None
+    git(repo, "switch", "-c", "feature")
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [i.status for i in items] == ["restored"]
+    assert git(repo, "rev-parse", "HEAD") == outcome.before_head
+
+
+async def test_undo_with_a_detached_head_counts_as_a_different_branch(
+    make_repo, push_upstream, git, tmp_path
+):
+    repo, root, journal, outcome = await _pulled_on_branch(make_repo, push_upstream, git, tmp_path)
+    git(repo, "checkout", "--detach")
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [(i.status, i.detail) for i in items] == [("skipped", _branch_detail("HEAD", "main"))]
+    assert git(repo, "rev-parse", "HEAD") == outcome.after_head
+
+
+async def test_branch_names_in_the_skip_detail_are_cleaned(make_repo, git, tmp_path):
+    repo = make_repo("a")
+    head = git(repo, "rev-parse", "HEAD")
+    journal = Journal(tmp_path)
+    journal.record("x", [JournalEntry(
+        repo=str(repo), op="pull", before_head="1" * 40, after_head=head, branch="x\x1b[31my\x07",
+    )])
+    _, items = await undo_last(tmp_path, journal, confirm_moved=_must_not_ask)
+    assert items[0].status == "skipped"
+    assert items[0].detail == _branch_detail("main", "xy")
+
+
+async def test_already_at_before_head_wins_over_the_branch_check(make_repo, push_upstream, git, tmp_path):
+    repo, root, journal, outcome = await _pulled_on_branch(make_repo, push_upstream, git, tmp_path)
+    git(repo, "reset", "--hard", outcome.before_head)
+    git(repo, "switch", "-c", "feature")
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [(i.status, i.detail) for i in items] == [("skipped", f"already at {outcome.before_head[:7]}")]
+    assert journal.last_undoable() is None  # permanent skip: the op set is closed
+
+
+async def test_the_reversal_journal_entry_keeps_the_branch(make_repo, push_upstream, git, tmp_path):
+    repo, root, journal, outcome = await _pulled_on_branch(make_repo, push_upstream, git, tmp_path)
+    await undo_last(root, journal)
+    (reversal,) = journal.last_undoable().entries
+    assert (reversal.op, reversal.branch) == ("undo", "main")
+
+
+async def test_different_history_on_the_same_branch_is_still_skipped_without_prompt(
+    make_repo, push_upstream, git, commit_local, tmp_path
+):
+    repo, root, journal, outcome = await _pulled_on_branch(make_repo, push_upstream, git, tmp_path)
+    git(repo, "reset", "--hard", outcome.before_head)  # still on main, but history was rewritten
+    commit_local(repo, "other.txt")
+    before = journal.last_undoable()
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [(i.status, i.detail) for i in items] == [("skipped", DIFFERENT_HISTORY)]
+    assert journal.last_undoable() == before

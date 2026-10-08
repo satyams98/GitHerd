@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -7,8 +9,10 @@ from githerd.outcomes import (
     AuthRequired, BlockedDirty, Diverged, Failed, NetworkError, Ok, Outcome, UpToDate,
 )
 from githerd.repos import snapshot
-from githerd.runner import GitError, ProgressCb, run_git
+from githerd.runner import GitError, ProgressCb, git_env, run_git
 from githerd.textsafe import clean_message
+
+log = logging.getLogger("githerd.gitops")
 
 _AUTH_MARKERS = (
     "authentication failed", "could not read username", "could not read password",
@@ -117,6 +121,51 @@ async def _rev(repo: Path, ref: str) -> str:
     return res.stdout.strip() if res.ok else ""
 
 
+def parse_head_branch(stdout: str) -> tuple[str, str | None] | None:
+    """Parse ``git rev-parse HEAD --abbrev-ref HEAD`` output: the sha, then the branch name.
+
+    The branch is ``None`` for a detached HEAD (git prints ``HEAD``). Unparseable output
+    gives ``None``.
+    """
+    lines = stdout.split()
+    if len(lines) != 2:
+        return None
+    sha, branch = lines
+    return sha, (None if branch == "HEAD" else branch)
+
+
+async def head_and_branch(repo: Path) -> tuple[str, str | None] | None:
+    """``(head sha, branch or None if detached)`` in ONE git spawn; ``None`` when unreadable.
+
+    An unborn repo (no commits yet) or a path that is not a repo is unreadable.
+    """
+    res = await run_git(repo, "rev-parse", "HEAD", "--abbrev-ref", "HEAD")
+    return parse_head_branch(res.stdout) if res.ok else None
+
+
+def git_sync(repo: Path | str, *args: str, timeout: float = 10) -> str | None:
+    """Run ``git -C repo args`` synchronously: stripped stdout, or ``None`` on any failure.
+
+    Needs no event loop, so it is safe in a ``finally`` that runs during cancellation.
+    Never raises.
+    """
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout, env=git_env(),
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception as exc:  # timeout, git missing, OS error: never fatal to the caller
+        log.warning("git %s failed in %s: %r", " ".join(args), repo, exc)
+        return None
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def head_sync(repo: Path | str) -> str | None:
+    """Current HEAD sha read synchronously, or ``None`` when it cannot be read."""
+    return git_sync(repo, "rev-parse", "HEAD")
+
+
 async def pull(repo: Path, on_progress: ProgressCb | None = None) -> Outcome:
     try:
         return await _pull(repo, on_progress)
@@ -150,6 +199,7 @@ async def _pull(repo: Path, on_progress: ProgressCb | None) -> Outcome:
         files=len([ln for ln in names.stdout.splitlines() if ln.strip()]),
         before_head=before,
         after_head=after,
+        branch=snap.branch,
     )
 
 

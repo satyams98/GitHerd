@@ -242,3 +242,44 @@ def test_ctrl_c_during_a_plain_retry_prints_no_stash_note(make_repo, monkeypatch
             console, tmp_path, {repo: Failed(message="x")}, ASCII_GLYPHS, read_key=keys("r"),
         )
     assert STASH_NOTE not in console.file.getvalue()
+
+
+# ---- H2 item 3: entries carry the branch ---------------------------------------------
+
+def test_retry_journals_the_branch_it_pulled(make_repo, push_upstream, tmp_path):
+    repo = make_repo("a")
+    push_upstream(repo, "new.txt")
+    root = tmp_path / "work"
+    resolve_attention(
+        make(), root, {repo: Failed(message="transient")}, ASCII_GLYPHS, read_key=keys("r"),
+    )
+    (entry,) = Journal(root).last_undoable().entries
+    assert entry.branch == "main"
+
+
+def test_stash_and_pull_conflict_journals_the_branch(make_repo, push_upstream, tmp_path):
+    repo, outcome = _blocked(make_repo, push_upstream)
+    root = tmp_path / "work"
+    resolve_attention(make(), root, {repo: outcome}, ASCII_GLYPHS, read_key=keys("s", "k"))
+    (entry,) = Journal(root).last_undoable().entries
+    assert entry.after_head != entry.before_head
+    assert entry.branch == "main"
+
+
+def test_a_detached_head_is_journaled_without_a_branch(make_repo, push_upstream, git, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    push_upstream(repo, "new.txt")
+    git(repo, "fetch")
+    git(repo, "checkout", "--detach")
+    root = tmp_path / "work"
+
+    async def moves_detached_head(path, on_progress=None):
+        git(path, "reset", "--hard", "origin/main")  # HEAD moves while detached
+        return UpToDate()
+
+    monkeypatch.setattr(attention, "pull", moves_detached_head)
+    resolve_attention(
+        make(), root, {repo: Failed(message="x")}, ASCII_GLYPHS, read_key=keys("r"),
+    )
+    (entry,) = Journal(root).last_undoable().entries
+    assert entry.branch is None

@@ -17,6 +17,7 @@ class JournalEntry(BaseModel):
     op: str
     before_head: str
     after_head: str
+    branch: str | None = None  # branch the operation changed; None in old journals
 
 
 class OpSet(BaseModel):

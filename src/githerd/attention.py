@@ -9,12 +9,11 @@ from rich.console import Console
 from rich.text import Text
 
 from githerd.diffs import FileDiff, diffs_for
-from githerd.gitops import pull
+from githerd.bulk import HeadMove, record_pulls
+from githerd.gitops import head_and_branch, pull
 from githerd.interactive import run_git_interactive
-from githerd.journal import Journal, JournalEntry
 from githerd.outcomes import BlockedDirty, Outcome, describe
 from githerd.recover import stash_and_pull
-from githerd.runner import run_git
 from githerd.textsafe import clean_message
 from githerd.ui import keys
 from githerd.ui.cards import actions_for, needs_attention, render_card
@@ -26,47 +25,38 @@ log = logging.getLogger("githerd.attention")
 STASH_NOTE = "  if you had local changes, check 'git stash list'"
 
 Viewer = Callable[[list[FileDiff]], object]
-Heads = dict[Path, tuple[str, str]]  # repo -> (first HEAD before, last HEAD after)
+Heads = dict[Path, HeadMove]  # repo -> (first HEAD before, last HEAD after, branch it was on)
 
 
 def exit_code_for(outcomes: Iterable[Outcome]) -> int:
     return 2 if any(needs_attention(o) for o in outcomes) else 0
 
 
-def _head(repo: Path) -> str:
-    """Current HEAD sha, or "" when it cannot be read."""
+def _head(repo: Path) -> tuple[str, str | None]:
+    """``(HEAD sha, branch or None if detached)`` in one git spawn; ``("", None)`` if unreadable."""
     try:
-        res = asyncio.run(run_git(repo, "rev-parse", "HEAD"))
+        return asyncio.run(head_and_branch(repo)) or ("", None)
     except Exception:
-        return ""
-    return res.stdout.strip() if res.ok else ""
+        return "", None
 
 
-def _record_move(heads: Heads, repo: Path, before: str, after: str) -> None:
-    first = heads[repo][0] if repo in heads else before
-    heads[repo] = (first, after)
+def _record_move(heads: Heads, repo: Path, before: str, after: str, branch: str | None) -> None:
+    first, _, first_branch = heads[repo] if repo in heads else (before, after, branch)
+    heads[repo] = (first, after, first_branch)
 
 
 def _record_moves(root: Path, description: str, heads: Heads) -> None:
     """Journal every repo whose HEAD moved; journalling must never crash a finished action."""
-    entries = [
-        JournalEntry(repo=str(repo), op="pull", before_head=before, after_head=after)
-        for repo, (before, after) in heads.items()
-        if before and after and before != after
-    ]
-    try:
-        Journal(root).record(description, entries)
-    except Exception:
-        log.exception("failed to write journal for %s", description)
+    record_pulls(root, description, {}, heads)
 
 
 def _mutate(repo: Path, heads: Heads, action: Callable[[], Outcome]) -> Outcome:
     """Run a mutating action, noting whether it moved HEAD (whatever outcome it returns)."""
-    before = _head(repo)
+    before, branch = _head(repo)
     try:
         return action()
     finally:  # also on Ctrl+C, so a half-finished pull stays undoable
-        _record_move(heads, repo, before, _head(repo))
+        _record_move(heads, repo, before, _head(repo)[0], branch)
 
 
 def _resolve_one(
@@ -121,6 +111,6 @@ def resolve_attention(
             if needs_attention(outcome):
                 final[repo] = _resolve_one(console, repo, outcome, glyphs, reader, viewer, heads)
     finally:  # a Ctrl+C part-way through still journals what was already done
-        moved = sum(1 for before, after in heads.values() if before and after and before != after)
+        moved = sum(1 for before, after, _ in heads.values() if before and after and before != after)
         _record_moves(root, f"resolve {moved} repos", heads)
     return final

@@ -349,3 +349,197 @@ async def test_pull_repos_rejects_invalid_timeout_before_any_work(monkeypatch, t
     with pytest.raises(ValueError, match="timeout must be a positive number of seconds"):
         await pull_repos(tmp_path / "work", [tmp_path / "r"], timeout=timeout)
     assert not (tmp_path / "work").exists()  # nothing journalled either
+
+
+def test_pull_entries_copy_the_branch(tmp_path):
+    from githerd.bulk import pull_entries
+
+    moved = Ok(commits=1, files=1, before_head="a", after_head="b", branch="feature/x")
+    plain = Ok(commits=1, files=1, before_head="a", after_head="b")
+    entries = pull_entries({tmp_path / "m": moved, tmp_path / "p": plain})
+    assert [e.branch for e in entries] == ["feature/x", None]
+
+
+# ---- H2 item 2: journal by HEAD comparison -------------------------------------------
+
+def _git_init_unborn(path):
+    import subprocess
+
+    subprocess.run(["git", "init", "-b", "main", str(path)], check=True, capture_output=True)
+    return path
+
+
+def _moves_then_sleeps(moved: asyncio.Event | None = None):
+    """A pull op that really fast-forwards the repo, then never finishes in time."""
+    from githerd.runner import run_git
+
+    async def op(repo, progress):
+        res = await run_git(repo, "pull", "--ff-only")
+        assert res.ok, res.stderr
+        if moved is not None:
+            moved.set()
+        await asyncio.sleep(60)
+        return UpToDate()
+
+    return op
+
+
+async def test_pull_that_moves_head_then_times_out_is_still_journaled(
+    monkeypatch, make_repo, push_upstream, git, tmp_path
+):
+    root = tmp_path / "work"
+    a = make_repo("a")
+    push_upstream(a, "new.txt")
+    before = git(a, "rev-parse", "HEAD")
+    monkeypatch.setattr(bulk, "pull", _moves_then_sleeps())
+    results = await pull_repos(root, [a], timeout=3)
+    assert isinstance(results[a], Failed) and "timed out" in results[a].message
+    after = git(a, "rev-parse", "HEAD")
+    assert after != before
+    op_set = Journal(root).last_undoable()
+    assert op_set is not None
+    (entry,) = op_set.entries
+    assert (entry.repo, entry.op) == (str(a), "pull")
+    assert (entry.before_head, entry.after_head, entry.branch) == (before, after, "main")
+
+
+async def test_pull_that_moves_head_then_is_cancelled_is_still_journaled(
+    monkeypatch, make_repo, push_upstream, git, tmp_path
+):
+    root = tmp_path / "work"
+    a = make_repo("a")
+    push_upstream(a, "new.txt")
+    before = git(a, "rev-parse", "HEAD")
+    moved = asyncio.Event()
+    monkeypatch.setattr(bulk, "pull", _moves_then_sleeps(moved))
+    task = asyncio.create_task(pull_repos(root, [a]))
+    await asyncio.wait_for(moved.wait(), timeout=30)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    op_set = Journal(root).last_undoable()
+    assert op_set is not None
+    (entry,) = op_set.entries
+    assert (entry.before_head, entry.after_head, entry.branch) == (
+        before, git(a, "rev-parse", "HEAD"), "main")
+
+
+async def test_failed_repo_whose_head_did_not_move_gets_no_entry(monkeypatch, make_repo, tmp_path):
+    root = tmp_path / "work"
+    a = make_repo("a")
+
+    async def fails(repo, progress):
+        raise RuntimeError("kaput")
+
+    monkeypatch.setattr(bulk, "pull", fails)
+    results = await pull_repos(root, [a])
+    assert isinstance(results[a], Failed)
+    assert Journal(root).last_undoable() is None
+
+
+async def test_unborn_repo_is_skipped_without_error(monkeypatch, make_repo, push_upstream, tmp_path):
+    root = tmp_path / "work"
+    a = make_repo("a")
+    push_upstream(a, "a.txt")
+    unborn = _git_init_unborn(tmp_path / "unborn")
+    real_pull = bulk.pull
+
+    async def fake(repo, progress):
+        if repo == unborn:
+            return Failed(message="no commits")
+        return await real_pull(repo, progress)
+
+    monkeypatch.setattr(bulk, "pull", fake)
+    results = await pull_repos(root, [a, unborn])
+    assert isinstance(results[a], Ok) and isinstance(results[unborn], Failed)
+    op_set = Journal(root).last_undoable()
+    assert [e.repo for e in op_set.entries] == [str(a)]
+
+
+async def test_a_failing_before_read_does_not_break_the_run(monkeypatch, make_repo, push_upstream, tmp_path):
+    root = tmp_path / "work"
+    a = make_repo("a")
+    push_upstream(a, "a.txt")
+
+    async def boom(repo):
+        raise RuntimeError("cannot read")
+
+    monkeypatch.setattr(bulk, "head_and_branch", boom)
+    results = await pull_repos(root, [a])
+    assert isinstance(results[a], Ok)
+    op_set = Journal(root).last_undoable()  # the Ok outcome still carries its own heads
+    assert [e.repo for e in op_set.entries] == [str(a)]
+
+
+async def test_a_failing_after_read_does_not_break_the_run(monkeypatch, make_repo, tmp_path):
+    root = tmp_path / "work"
+    a = make_repo("a")
+
+    async def fails(repo, progress):
+        raise RuntimeError("kaput")
+
+    def boom(repo):
+        raise RuntimeError("cannot read")
+
+    monkeypatch.setattr(bulk, "pull", fails)
+    monkeypatch.setattr(bulk, "head_sync", boom)
+    results = await pull_repos(root, [a])
+    assert isinstance(results[a], Failed)
+    assert Journal(root).last_undoable() is None
+
+
+async def test_before_read_is_one_call_per_repo_with_bounded_concurrency(monkeypatch, tmp_path):
+    repos = [tmp_path / f"r{i}" for i in range(6)]
+    active = peak = 0
+    seen = []
+
+    async def fake_read(repo):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        seen.append(repo)
+        return ("a" * 40, "main")
+
+    async def op(repo, progress):
+        return UpToDate()
+
+    monkeypatch.setattr(bulk, "head_and_branch", fake_read)
+    monkeypatch.setattr(bulk, "pull", op)
+    monkeypatch.setattr(bulk, "head_sync", lambda repo: "a" * 40)
+    await pull_repos(tmp_path / "work", repos, concurrency=2)
+    assert sorted(seen) == sorted(repos)
+    assert peak == 2
+
+
+async def test_ok_outcomes_are_journaled_without_re_reading_head(monkeypatch, make_repo, push_upstream, tmp_path):
+    root = tmp_path / "work"
+    a, c = make_repo("a"), make_repo("c")
+    push_upstream(a, "a.txt")
+    reread = []
+    real = bulk.head_sync
+
+    def spy(repo):
+        reread.append(repo)
+        return real(repo)
+
+    monkeypatch.setattr(bulk, "head_sync", spy)
+    results = await pull_repos(root, [a, c])
+    assert isinstance(results[a], Ok) and results[c] == UpToDate()
+    assert reread == [c]  # only the repo without an Ok outcome is read again
+    (entry,) = Journal(root).last_undoable().entries
+    assert (entry.repo, entry.branch) == (str(a), "main")
+
+
+def test_record_pulls_adds_head_moves_the_outcomes_do_not_carry(tmp_path):
+    moved = Ok(commits=1, files=1, before_head="a" * 40, after_head="b" * 40, branch="main")
+    bulk.record_pulls(tmp_path, "pull 2 repos", {tmp_path / "m": moved},
+                      moves={tmp_path / "x": ("c" * 40, "d" * 40, "dev"),
+                             tmp_path / "same": ("e" * 40, "e" * 40, "dev"),
+                             tmp_path / "m": ("1" * 40, "2" * 40, "other")})
+    op_set = Journal(tmp_path).last_undoable()
+    assert sorted((e.repo, e.before_head, e.after_head, e.branch) for e in op_set.entries) == sorted([
+        (str(tmp_path / "m"), "a" * 40, "b" * 40, "main"),   # the outcome wins
+        (str(tmp_path / "x"), "c" * 40, "d" * 40, "dev"),
+    ])

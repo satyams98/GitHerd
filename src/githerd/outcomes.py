@@ -19,6 +19,7 @@ class Ok(BaseModel):
     files: int
     before_head: str
     after_head: str
+    branch: str | None = None  # branch that was pulled; None when unknown or detached
 
 
 class UpToDate(BaseModel):
