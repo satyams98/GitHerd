@@ -1,4 +1,6 @@
 import asyncio
+import subprocess
+import types
 
 import pytest
 
@@ -239,3 +241,75 @@ async def test_failing_emergency_pop_still_propagates_and_keeps_the_stash(make_r
     with pytest.raises(KeyboardInterrupt):
         await stash_and_pull(repo)
     assert_work_not_lost(repo, git, {"README.md": "dirty\n"})  # still in `git stash list`
+
+
+def test_sync_git_decodes_as_utf8_and_never_raises_on_undecodable_bytes(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"\x81\x8d ok".decode("utf-8", "replace"), stderr="")
+
+    monkeypatch.setattr(githerd.recover, "subprocess", types.SimpleNamespace(run=fake_run))
+    githerd.recover._sync_git(tmp_path, "status")
+    assert seen["text"] is True
+    assert seen["encoding"] == "utf-8" and seen["errors"] == "replace"
+
+
+async def test_undecodable_git_output_does_not_break_the_synchronous_restore(make_repo, git, monkeypatch):
+    repo = make_repo("a")
+    (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+    real_run_git = githerd.recover.run_git
+    real_run = subprocess.run
+
+    async def broken_pop(repo, *args, **kwargs):
+        if args[:2] == ("stash", "pop"):
+            raise asyncio.CancelledError
+        return await real_run_git(repo, *args, **kwargs)
+
+    async def interrupted_pull(repo, on_progress=None):
+        raise KeyboardInterrupt
+
+    def run_with_cp1252_default(cmd, **kwargs):
+        if kwargs.get("encoding") is None and kwargs.get("text"):
+            raise UnicodeDecodeError("cp1252", b"\x81", 0, 1, "character maps to <undefined>")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(githerd.recover, "run_git", broken_pop)
+    monkeypatch.setattr(githerd.recover, "pull", interrupted_pull)
+    shim = types.SimpleNamespace(run=run_with_cp1252_default)  # leave the real module alone
+    monkeypatch.setattr(githerd.recover, "subprocess", shim)
+    with pytest.raises(KeyboardInterrupt):
+        await stash_and_pull(repo)
+    assert_work_not_lost(repo, git, {"README.md": "dirty\n"})
+    assert git(repo, "stash", "list") == ""  # the synchronous pop really ran
+
+
+async def test_failed_synchronous_restore_logs_a_warning_without_a_traceback(
+    make_repo, git, monkeypatch, caplog
+):
+    repo = make_repo("a")
+    (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+    real_run_git = githerd.recover.run_git
+
+    async def broken_pop(repo, *args, **kwargs):
+        if args[:2] == ("stash", "pop"):
+            raise OSError("cannot spawn git")
+        return await real_run_git(repo, *args, **kwargs)
+
+    async def interrupted_pull(repo, on_progress=None):
+        raise KeyboardInterrupt
+
+    def broken_sync(*args, **kwargs):
+        raise OSError("cannot spawn git")
+
+    monkeypatch.setattr(githerd.recover, "run_git", broken_pop)
+    monkeypatch.setattr(githerd.recover, "pull", interrupted_pull)
+    monkeypatch.setattr(githerd.recover, "_sync_git", broken_sync)
+    with caplog.at_level("DEBUG", logger="githerd.recover"):
+        with pytest.raises(KeyboardInterrupt):
+            await stash_and_pull(repo)
+    records = [r for r in caplog.records if r.name == "githerd.recover"]
+    assert records and all(r.levelname == "WARNING" for r in records)
+    assert all(r.exc_info is None for r in records)
+    assert "cannot spawn git" in caplog.text

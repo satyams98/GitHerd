@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Annotated, Iterator, Optional
 
 import typer
+from rich.cells import cell_len
 from rich.console import Console
 from rich.text import Text
 
@@ -151,11 +152,12 @@ def pull(
             if _moved_any(results):
                 console.print(Text(UNDO_HINT, style="dim"))
         else:
-            width = max(len(r.name) for r in repos)
+            width = max(cell_len(safe_path(r.name)) for r in repos)
 
             def on_event(event: RepoEvent) -> None:
                 if event.kind == "done" and event.outcome is not None:
-                    typer.echo(f"{safe_path(Path(event.repo).name):<{width}}  {describe(event.outcome)}")
+                    name = safe_path(Path(event.repo).name)
+                    typer.echo(f"{name + ' ' * max(0, width - cell_len(name))}  {describe(event.outcome)}")
 
             results = asyncio.run(
                 pull_repos(base, repos, concurrency=jobs, timeout=timeout, on_event=on_event)

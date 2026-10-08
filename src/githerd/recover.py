@@ -51,7 +51,8 @@ def _sync_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Plain blocking git call; usable when the event loop is being torn down."""
     return subprocess.run(
         ["git", "-C", str(repo), *args],
-        capture_output=True, text=True, env=git_env(), timeout=60, check=False,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=git_env(), timeout=60, check=False,
     )
 
 
@@ -73,8 +74,11 @@ async def _restore_after_interrupt(repo: Path, before: str) -> None:
         tip = top.stdout.strip() if top.returncode == 0 else ""
         if tip and tip != before:
             _sync_git(repo, "stash", "pop")
-    except Exception:
-        log.exception("could not restore stashed changes in %s; they are in `git stash`", repo)
+    except Exception as exc:  # expected failures (git missing, timeout): no traceback on the terminal
+        log.warning(
+            "could not restore stashed changes in %s: %s; check `git stash list`",
+            repo, clean_message(str(exc)) or type(exc).__name__,
+        )
 
 
 async def stash_and_pull(repo: Path, on_progress: ProgressCb | None = None) -> Outcome:

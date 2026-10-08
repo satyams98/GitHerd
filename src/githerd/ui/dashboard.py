@@ -11,6 +11,7 @@ from rich.text import Text
 
 from githerd.bulk import RepoEvent
 from githerd.runner import parse_progress
+from githerd.textsafe import safe_path
 from githerd.ui.rows import RowState, bar, fit, render_row
 from githerd.ui.theme import Glyphs
 
@@ -74,7 +75,7 @@ class Dashboard:
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         width = max(options.max_width, 0)
         yield self._header(width)
-        name_w = min(24, max((cell_len(r.name) for r in self.rows.values()), default=0))
+        name_w = min(24, max((cell_len(safe_path(r.name)) for r in self.rows.values()), default=0))
         branch_w = min(16, max((cell_len(r.branch) for r in self.rows.values()), default=0))
         for row in self.rows.values():
             yield render_row(row, self.glyphs, name_w=name_w, branch_w=branch_w, width=width)

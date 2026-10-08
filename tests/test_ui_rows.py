@@ -274,3 +274,18 @@ def test_render_status_name_cap_default_and_none():
     assert long_name in uncapped
     wide = render_status([_snap(long_name, branch="main")], ASCII_GLYPHS, max_name_width=10).plain
     assert long_name not in wide
+
+
+EVIL_NAME = "evil\u202e\x1b[2Jname"
+
+
+def test_row_and_status_lines_print_no_control_or_bidi_characters_from_a_repo_name():
+    state = RowState(path="/w/x", name=EVIL_NAME, branch="main", status="queued")
+    line = render_row(state, ASCII_GLYPHS, name_w=12, branch_w=6, width=60)
+    assert "\x1b" not in line.plain and "\u202e" not in line.plain
+    assert "evil" in line.plain and "name" in line.plain
+    assert cell_len(line.plain) == 60
+    status = render_status([_snap(EVIL_NAME, branch="main")], ASCII_GLYPHS).plain
+    assert "\x1b" not in status and "\u202e" not in status and "evil" in status
+    broken = render_status([_snap(EVIL_NAME, error="boom")], ASCII_GLYPHS).plain
+    assert "\x1b" not in broken and "\u202e" not in broken and "evil" in broken

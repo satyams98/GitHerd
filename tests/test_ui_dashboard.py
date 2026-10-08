@@ -250,3 +250,14 @@ def test_live_dashboard_final_frame_survives_without_explicit_refresh():
 def test_header_is_empty_at_zero_width():
     dash, _ = make_dashboard()
     assert dash._header(0).plain == ""
+
+
+def test_dashboard_row_for_a_hostile_repo_name_has_no_control_characters_and_aligned_columns():
+    evil = "evil\u202e\x1b[2Jname"
+    dash = Dashboard([Path("/w") / evil, Path("/w/b")], {}, ASCII_GLYPHS)
+    text = render_plain(dash, width=60)
+    assert "\x1b" not in text and "\u202e" not in text
+    lines = [ln for ln in text.splitlines() if "queued" in ln]
+    assert len(lines) == 2
+    assert lines[0].index("queued") == lines[1].index("queued")  # widths use the cleaned names
+    assert lines[0].split()[1] == "evil?name"  # safe_path shows the override as ?

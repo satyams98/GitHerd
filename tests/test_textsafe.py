@@ -1,4 +1,5 @@
 import io
+import time
 
 import pytest
 from rich.cells import cell_len
@@ -49,9 +50,15 @@ def test_control_characters_are_dropped():
     assert clean_message("a\x00b\x07c\x08d\x7fe\x85f\x9bg") == "abcdefg"
 
 
-def test_bidi_and_separator_characters_are_dropped():
-    nasty = "a\u202ab\u202eb\u2066c\u2069d\u200ee\u200ff\u061cg\u2028h\u2029i"
-    assert clean_message(nasty) == "abbcdefghi"
+def test_dangerous_bidi_and_separator_characters_are_dropped():
+    nasty = "a\u202ab\u202eb\u2066c\u2069d\u2028e\u2029f"
+    assert clean_message(nasty) == "abbcdef"
+
+
+def test_plain_directional_marks_are_kept_for_legitimate_rtl_text():
+    text = "a\u200eb\u200fc\u061cd"
+    assert clean_message(text) == text
+    assert safe_path(text) == text
 
 
 def test_whitespace_runs_including_newlines_collapse_to_single_spaces():
@@ -70,7 +77,11 @@ def test_multi_line_git_text_becomes_one_line():
     ("https://user:ghp_SECRET@github.com/o/r.git", "https://github.com/o/r.git"),
     ("fatal: unable to access 'https://tok@host/o/r.git/': timed out",
      "fatal: unable to access 'https://host/o/r.git/': timed out"),
-    ("ssh://git@host/r and https://a:b@h2/x", "ssh://host/r and https://h2/x"),
+    ("ssh://git:pw@host/r and https://a:b@h2/x", "ssh://host/r and https://h2/x"),
+    ("https://user:p@ss@host/r.git", "https://host/r.git"),
+    ("http://a:b@c@d/", "http://d/"),
+    ("http://u:p@[::1]:8080/x", "http://[::1]:8080/x"),
+    ("https://tok@host/r.git", "https://host/r.git"),
 ])
 def test_userinfo_in_urls_is_redacted(text, expected):
     out = clean_message(text)
@@ -81,6 +92,75 @@ def test_userinfo_in_urls_is_redacted(text, expected):
 def test_urls_without_userinfo_and_scp_style_remotes_are_untouched():
     assert clean_message("see https://host/o/r.git") == "see https://host/o/r.git"
     assert clean_message("git@github.com:o/r.git") == "git@github.com:o/r.git"
+
+
+@pytest.mark.parametrize("text", [
+    "https://github.com/o/r@v1",
+    "https://registry.npmjs.org/@scope/pkg",
+    "https://host/path?x=a@b",
+    "https://host/path#frag@x",
+    "mail me at a@b.c or see https://host/x",
+])
+def test_at_signs_outside_the_authority_are_not_userinfo(text):
+    assert clean_message(text) == text
+
+
+def test_ssh_urls_keep_a_bare_username_but_lose_any_password():
+    # A bare username such as ``git`` in an ssh URL is not a secret; tokens in
+    # http(s)/other URLs are often passed as the "username", so those are redacted.
+    assert clean_message("ssh://git@host/x") == "ssh://git@host/x"
+    assert clean_message("git+ssh://git@host/x") == "git+ssh://git@host/x"
+    assert clean_message("ssh://git:pw@host/x") == "ssh://host/x"
+    assert clean_message("SSH://git@host:22/x") == "SSH://git@host:22/x"
+
+
+IDEMPOTENCE_TABLE = [
+    "https://user:p@ss@host/r.git",
+    "http://a:b@c@d/",
+    "https://github.com/o/r@v1",
+    "https://registry.npmjs.org/@scope/pkg",
+    "https://host/path?x=a@b",
+    "ssh://git@host/x",
+    "ssh://git:pw@host/x",
+    "http://u:p@[::1]:8080/x",
+    "http://x@http://y:z@h",
+    "a://b@c://d:e@f",
+    "https://u:p@h/x https://v:q@i/y",
+    "https://us\x1b[mer:ghp_SECRET@host/r",
+    "@@@://@@@",
+    "://@",
+    "http://@host",
+    "http://:@host",
+    "git@github.com:o/r.git",
+    "x" * 70 + "://u:p@h",
+    "1http://u:p@h",
+]
+
+
+@pytest.mark.parametrize("text", IDEMPOTENCE_TABLE)
+def test_clean_message_is_idempotent_on_tricky_inputs(text):
+    once = clean_message(text)
+    assert clean_message(once) == once
+    assert "ghp_SECRET" not in once and "p@ss" not in once
+
+
+@pytest.mark.parametrize("text", [
+    "x" * 200_000,
+    "a://" + "x" * 200_000,
+    "http://" * 30_000,
+    "\x1b]" * 200_000,
+    " " * 1_000_000,
+    "@" * 200_000,
+    "://" * 50_000,
+    "a://" + "@" * 200_000,
+    "a://" + ":@" * 100_000,
+    "a://u:p@" * 30_000,
+    "a" * 31 + "://" + "b" * 200_000,
+], ids=lambda t: f"{t[:12]!r}x{len(t)}")
+def test_clean_message_runs_in_linear_time(text):
+    start = time.perf_counter()
+    clean_message(text)
+    assert time.perf_counter() - start < 1.0
 
 
 def test_userinfo_hidden_behind_an_escape_is_still_redacted():

@@ -417,3 +417,27 @@ def test_interactive_pull_prints_no_undo_hint_when_nothing_moved(make_repo, monk
     result = runner.invoke(app, ["pull", "--root", str(root)])
     assert result.exit_code == 0, result.output
     assert UNDO_HINT not in console.export_text()
+
+
+def test_plain_pull_line_for_a_hostile_repo_name_is_clean_and_aligned(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    from githerd.bulk import RepoEvent
+    from githerd.outcomes import UpToDate, describe
+
+    evil = tmp_path / "evil\u202e\x1b[2Jname"  # never touches the file system
+    other = tmp_path / "b"
+    monkeypatch.setattr(cli, "_repos", lambda root: (tmp_path, [evil, other]))
+
+    async def fake_pull_repos(base, repos, *, concurrency=5, on_event=None, timeout=None):
+        for repo in repos:
+            on_event(RepoEvent(repo=str(repo), kind="done", outcome=UpToDate()))
+        return {repo: UpToDate() for repo in repos}
+
+    monkeypatch.setattr(cli, "pull_repos", fake_pull_repos)
+    result = runner.invoke(app, ["pull", "--root", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "\x1b" not in result.output and "\u202e" not in result.output
+    done = describe(UpToDate())
+    lines = [ln for ln in result.output.splitlines() if ln.endswith(done)]
+    assert lines == [f"evil?name  {done}", f"{'b':<9}  {done}"]

@@ -11,7 +11,7 @@ from githerd.outcomes import (
     describe,
 )
 from githerd.repos import RepoSnapshot
-from githerd.textsafe import clean_message
+from githerd.textsafe import clean_message, safe_path
 from githerd.ui.theme import Glyphs
 
 Status = Literal["queued", "running", "done"]
@@ -89,7 +89,7 @@ def render_row(
     glyph, style = _glyph_and_style(state, glyphs)
     line = Text()
     line.append(f"{glyph} ", style=style)
-    line.append(_pad(fit(state.name, name_w, glyphs), name_w), style="subject")
+    line.append(_pad(fit(safe_path(state.name), name_w, glyphs), name_w), style="subject")
     line.append("  " + _pad(fit(state.branch, branch_w, glyphs), branch_w), style="dim")
     line.append("  ")
     detail_style = "dim" if state.status == "queued" or isinstance(state.outcome, UpToDate) else ""
@@ -129,25 +129,26 @@ def render_status(
     snaps: list[RepoSnapshot], glyphs: Glyphs, *, max_name_width: int | None = 24
 ) -> Text:
     """One line per repo. ``max_name_width=None`` never truncates names (plain, piped output)."""
-    longest_name = max((cell_len(s.name) for s in snaps), default=0)
+    names = [safe_path(s.name) for s in snaps]
+    longest_name = max((cell_len(n) for n in names), default=0)
     name_w = longest_name if max_name_width is None else min(max_name_width, longest_name)
     branch_w = min(16, max((cell_len(s.branch or "(detached)") for s in snaps), default=0))
     sync_w = max((cell_len(_sync_text(s, glyphs)) for s in snaps if not s.error), default=0)
     out = Text()
-    for index, snap in enumerate(snaps):
+    for index, (snap, name) in enumerate(zip(snaps, names)):
         if index:
             out.append("\n")
         if snap.error:
             first = clean_message(snap.error.splitlines()[0]) if snap.error.strip() else snap.error
             out.append(f"{glyphs.fail} ", style="error")
-            out.append(_pad(fit(snap.name, name_w, glyphs), name_w), style="subject")
+            out.append(_pad(fit(name, name_w, glyphs), name_w), style="subject")
             out.append(f"  error: {first}", style="error")
             continue
         glyph, style = (glyphs.attn, "warn") if snap.dirty else (glyphs.ok, "ok")
         branch = snap.branch or "(detached)"
         changes = f"{len(snap.dirty)} changed" if snap.dirty else "clean"
         out.append(f"{glyph} ", style=style)
-        out.append(_pad(fit(snap.name, name_w, glyphs), name_w), style="subject")
+        out.append(_pad(fit(name, name_w, glyphs), name_w), style="subject")
         out.append("  " + _pad(fit(branch, branch_w, glyphs), branch_w), style="dim")
         out.append("  " + _pad(_sync_text(snap, glyphs), sync_w), style="dim")
         out.append("  ")  # columns are always separated, whatever the sync text width

@@ -23,7 +23,7 @@ from githerd.ui.theme import Glyphs
 
 log = logging.getLogger("githerd.attention")
 
-STASH_NOTE = "  your local changes are in 'git stash' (git stash list)"
+STASH_NOTE = "  if you had local changes, check 'git stash list'"
 
 Viewer = Callable[[list[FileDiff]], object]
 Heads = dict[Path, tuple[str, str]]  # repo -> (first HEAD before, last HEAD after)
@@ -93,7 +93,7 @@ def _resolve_one(
         if action.id == "stash_pull":
             try:
                 outcome = _mutate(repo, heads, lambda: asyncio.run(stash_and_pull(repo)))
-            except BaseException:  # Ctrl+C: the work may be (or have been left) in the stash
+            except BaseException:  # Ctrl+C: any stashed work may or may not have been put back
                 console.print(Text(STASH_NOTE, style="dim"))
                 raise
         elif action.id == "auth":

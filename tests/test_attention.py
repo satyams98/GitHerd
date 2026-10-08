@@ -192,7 +192,7 @@ def test_outcome_text_is_printed_literally_and_output_is_ascii(make_repo, tmp_pa
 
 # ---- review fixes: viewer failures and stranded stashes ----------------------------
 
-STASH_NOTE = "your local changes are in 'git stash' (git stash list)"
+STASH_NOTE = "if you had local changes, check 'git stash list'"
 
 
 def test_any_diff_viewer_failure_is_a_dim_note_not_a_crash(make_repo, push_upstream, tmp_path):
