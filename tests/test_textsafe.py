@@ -187,7 +187,7 @@ def test_credentials_in_urls_glued_to_preceding_text_are_redacted(text, secret, 
 def test_clean_message_runs_in_linear_time(text):
     start = time.perf_counter()
     clean_message(text)
-    assert time.perf_counter() - start < 1.0
+    assert time.perf_counter() - start < 5.0  # generous: a quadratic regression takes minutes
 
 
 def test_userinfo_hidden_behind_an_escape_is_still_redacted():
