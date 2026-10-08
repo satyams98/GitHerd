@@ -170,3 +170,59 @@ async def test_failure_path_passes_redacted_remote_to_classify_failure(
     assert captured, "classify_failure was never reached"
     assert all("ghp_SECRETTOKEN" not in r for r in captured)
     assert captured == [_REDACTED_URL]
+
+
+from githerd.gitops import _unquote_git_path, parse_blocking_files  # noqa: E402
+
+
+def test_parse_blocking_files_handles_both_git_messages():
+    tracked = (
+        "error: Your local changes to the following files would be overwritten by merge:\n"
+        "\tREADME.md\n\tsrc/a.py\n"
+        "Please commit your changes or stash them before you merge.\nAborting\n"
+    )
+    untracked = (
+        "error: The following untracked working tree files would be overwritten by merge:\n"
+        "\tnew.txt\nPlease move or remove them before you merge.\nAborting\n"
+    )
+    assert parse_blocking_files(tracked) == ["README.md", "src/a.py"]
+    assert parse_blocking_files(untracked) == ["new.txt"]
+    assert parse_blocking_files("fatal: unrelated") == []
+
+
+def test_unquote_git_path_decodes_c_style_quoting():
+    assert _unquote_git_path(r'"na\303\257ve.txt"') == "naïve.txt"
+    assert _unquote_git_path(r'"a\\b\"c\td\ne"') == 'a\\b"c\td\ne'
+    assert _unquote_git_path("plain name.txt") == "plain name.txt"
+    assert _unquote_git_path(r'"\346\227\245\346\234\254.txt"') == "日本.txt"
+
+
+def test_parse_blocking_files_unquotes_and_keeps_spaces():
+    stderr = (
+        "error: The following untracked working tree files would be overwritten by merge:\n"
+        '\t"na\\303\\257ve.txt"\n\tmy file.txt\n\t"tab\\there.txt"\n'
+        "Please move or remove them before you merge.\nAborting\n"
+    )
+    assert parse_blocking_files(stderr) == ["naïve.txt", "my file.txt", "tab\there.txt"]
+
+
+async def test_pull_blocked_reports_the_blocking_files(make_repo, push_upstream):
+    repo = make_repo("a")
+    (repo / "README.md").write_text("local edit\n", encoding="utf-8")
+    (repo / "scratch.txt").write_text("s\n", encoding="utf-8")
+    push_upstream(repo, "README.md", content="upstream edit\n")
+    outcome = await pull(repo)
+    assert isinstance(outcome, BlockedDirty)
+    assert outcome.blocking == ["README.md"]
+    assert sorted(f.path for f in outcome.files) == ["README.md", "scratch.txt"]
+
+
+async def test_pull_blocked_by_non_ascii_path_matches_file_change_path(make_repo, push_upstream):
+    repo = make_repo("a")
+    name = "naïve file.txt"
+    (repo / name).write_text("local\n", encoding="utf-8")
+    push_upstream(repo, name, content="upstream\n")
+    outcome = await pull(repo)
+    assert isinstance(outcome, BlockedDirty)
+    assert outcome.blocking == [name]
+    assert name in [f.path for f in outcome.files]

@@ -26,6 +26,60 @@ def _tail(text: str, lines: int = 3) -> str:
     return " | ".join(kept[-lines:])
 
 
+_SIMPLE_ESCAPES = {
+    "\\": "\\", '"': '"', "t": "\t", "n": "\n", "r": "\r",
+    "a": "\a", "b": "\b", "f": "\f", "v": "\v",
+}
+
+
+def _unquote_git_path(text: str) -> str:
+    """Undo git's C-style path quoting (``"na\\303\\257ve.txt"`` -> ``naïve.txt``).
+
+    Text that is not wrapped in double quotes is returned unchanged.
+    """
+    if len(text) < 2 or not (text.startswith('"') and text.endswith('"')):
+        return text
+    body = text[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\" or i + 1 >= len(body):
+            out += ch.encode("utf-8")
+            i += 1
+            continue
+        nxt = body[i + 1]
+        if nxt in "01234567":  # octal byte escape, up to three digits
+            j = i + 1
+            while j < len(body) and j < i + 4 and body[j] in "01234567":
+                j += 1
+            out.append(int(body[i + 1:j], 8) & 0xFF)
+            i = j
+        elif nxt in _SIMPLE_ESCAPES:
+            out += _SIMPLE_ESCAPES[nxt].encode("utf-8")
+            i += 2
+        else:  # unknown escape: keep it verbatim
+            out += ("\\" + nxt).encode("utf-8")
+            i += 2
+    return out.decode("utf-8", errors="replace")
+
+
+def parse_blocking_files(stderr: str) -> list[str]:
+    """Paths git lists under its 'would be overwritten' error messages."""
+    files: list[str] = []
+    capturing = False
+    for line in stderr.splitlines():
+        if "would be overwritten" in line.lower():
+            capturing = True
+            continue
+        if capturing:
+            if line.startswith(("\t", " ")) and line.strip():
+                files.append(_unquote_git_path(line.strip()))
+            else:
+                capturing = False
+    return files
+
+
 def classify_failure(stderr: str, remote: str = "") -> Outcome:
     low = stderr.lower()
     if any(m in low for m in _AUTH_MARKERS):  # checked first: ssh auth also says "could not read"
@@ -80,7 +134,7 @@ async def _pull(repo: Path, on_progress: ProgressCb | None) -> Outcome:
     if not res.ok:
         low = res.stderr.lower()
         if "would be overwritten" in low:
-            return BlockedDirty(files=snap.dirty)
+            return BlockedDirty(files=snap.dirty, blocking=parse_blocking_files(res.stderr))
         if "not possible to fast-forward" in low:
             again = await snapshot(repo)  # pull already fetched, counts are current
             return Diverged(ahead=again.ahead, behind=again.behind)
