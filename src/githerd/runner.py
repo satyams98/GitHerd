@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
+import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 ProgressCb = Callable[[str], None]
+
+log = logging.getLogger("githerd.runner")
 
 _PROGRESS_RE = re.compile(r"^(?:remote: )?(?P<phase>[A-Za-z ]+?):\s+(?P<pct>\d+)%")
 
@@ -43,14 +48,29 @@ def git_env() -> dict[str, str]:
     return env
 
 
+def _guarded(on_progress: ProgressCb | None) -> ProgressCb | None:
+    if on_progress is None:
+        return None
+
+    def safe(line: str) -> None:
+        try:
+            on_progress(line)
+        except Exception:  # a UI bug must never abort a git operation
+            log.exception("progress callback raised")
+
+    return safe
+
+
 async def _drain_stderr(stream: asyncio.StreamReader, on_progress: ProgressCb | None) -> str:
+    on_progress = _guarded(on_progress)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     chunks: list[str] = []
     buf = ""
     while True:
         data = await stream.read(4096)
         if not data:
             break
-        text = data.decode("utf-8", errors="replace")
+        text = decoder.decode(data)
         chunks.append(text)
         if on_progress:
             buf += text
@@ -59,9 +79,32 @@ async def _drain_stderr(stream: asyncio.StreamReader, on_progress: ProgressCb | 
             for part in parts:
                 if part.strip():
                     on_progress(part)
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        chunks.append(tail)
+        buf += tail
     if on_progress and buf.strip():
         on_progress(buf)
     return "".join(chunks)
+
+
+async def _kill_tree(proc) -> None:
+    """Kill git and the helpers it spawned (fetch/merge children keep pipes open)."""
+    if proc.returncode is not None:
+        return
+    if sys.platform == "win32":
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/F", "/T", "/PID", str(proc.pid),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.wait()
+        except Exception:
+            log.exception("taskkill failed for pid %s", proc.pid)
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(proc.wait(), 5)
 
 
 async def run_git(
@@ -83,8 +126,7 @@ async def run_git(
             proc.stdout.read(), _drain_stderr(proc.stderr, on_progress), proc.wait()
         )
     except BaseException:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
+        await _kill_tree(proc)
         raise
     code = proc.returncode if proc.returncode is not None else -1
     return GitResult(code=code, stdout=stdout_b.decode("utf-8", errors="replace"), stderr=stderr)

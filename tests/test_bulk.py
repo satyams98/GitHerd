@@ -175,3 +175,116 @@ async def test_pull_repos_survives_any_journal_exception(monkeypatch, make_repo,
     monkeypatch.setattr(bulk.Journal, "record", boom)
     results = await pull_repos(root, [a])
     assert isinstance(results[a], Ok)
+
+
+async def test_run_bulk_times_out_a_slow_operation(tmp_path):
+    slow, fast = tmp_path / "slow", tmp_path / "fast"
+
+    async def op(repo, progress):
+        if repo == slow:
+            await asyncio.sleep(5)
+        return UpToDate()
+
+    results = await run_bulk([slow, fast], op, timeout=0.05)
+    assert results[fast] == UpToDate()
+    assert isinstance(results[slow], Failed)
+    assert "timed out after 0.05s" in results[slow].message
+
+
+async def test_run_bulk_timeout_actually_cancels_the_operation(tmp_path):
+    repo = tmp_path / "r"
+    started = asyncio.Event()
+    cancelled: list[bool] = []
+
+    async def op(repo, progress):
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        finally:
+            cancelled.append(False)
+        return UpToDate()
+
+    results = await asyncio.wait_for(run_bulk([repo], op, timeout=0.05), timeout=5)
+    assert started.is_set()
+    assert cancelled == [True, False]  # CancelledError was delivered, then cleanup ran
+    assert isinstance(results[repo], Failed)
+
+
+@pytest.mark.parametrize("timeout", [None, 0])
+async def test_run_bulk_none_or_zero_timeout_means_no_timeout(tmp_path, timeout):
+    repo = tmp_path / "r"
+
+    async def op(repo, progress):
+        await asyncio.sleep(0.1)  # would exceed any tiny positive timeout
+        return UpToDate()
+
+    results = await run_bulk([repo], op, timeout=timeout)
+    assert results[repo] == UpToDate()
+
+
+async def test_run_bulk_timeout_does_not_swallow_outer_cancellation(tmp_path):
+    started = asyncio.Event()
+
+    async def op(repo, progress):
+        started.set()
+        await asyncio.sleep(30)
+        return UpToDate()
+
+    task = asyncio.create_task(run_bulk([tmp_path / "r"], op, timeout=10))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+
+def test_pull_entries_only_includes_ok_with_a_moved_head(tmp_path):
+    from githerd.bulk import pull_entries
+
+    moved = Ok(commits=1, files=1, before_head="a", after_head="b")
+    fetched = Ok(commits=1, files=0, before_head="a", after_head="a")
+    entries = pull_entries({
+        tmp_path / "m": moved, tmp_path / "f": fetched,
+        tmp_path / "u": UpToDate(), tmp_path / "x": Failed(message="x"),
+    })
+    assert [(e.repo, e.op, e.before_head, e.after_head) for e in entries] == [
+        (str(tmp_path / "m"), "pull", "a", "b")
+    ]
+
+
+def test_record_pulls_never_raises(tmp_path, monkeypatch):
+    from githerd import bulk
+
+    def boom(self, description, entries):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(bulk.Journal, "record", boom)
+    moved = Ok(commits=1, files=1, before_head="a", after_head="b")
+    bulk.record_pulls(tmp_path, "pull 1 repos", {tmp_path / "m": moved})  # must not raise
+
+
+def test_record_pulls_writes_a_journal_that_round_trips(tmp_path):
+    moved = Ok(commits=1, files=1, before_head="a" * 40, after_head="b" * 40)
+    bulk.record_pulls(tmp_path, "pull 2 repos", {
+        tmp_path / "m": moved, tmp_path / "u": UpToDate(),
+    })
+    op_set = Journal(tmp_path).last_undoable()
+    assert op_set is not None
+    assert op_set.description == "pull 2 repos"
+    assert [(e.repo, e.op, e.before_head, e.after_head) for e in op_set.entries] == [
+        (str(tmp_path / "m"), "pull", "a" * 40, "b" * 40)
+    ]
+
+
+async def test_pull_repos_forwards_timeout_to_run_bulk(monkeypatch, tmp_path):
+    seen: dict = {}
+
+    async def fake_run_bulk(repos, op, **kwargs):
+        seen.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(bulk, "run_bulk", fake_run_bulk)
+    await pull_repos(tmp_path, [], timeout=12.5)
+    assert seen["timeout"] == 12.5

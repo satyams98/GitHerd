@@ -33,7 +33,13 @@ async def run_bulk(
     *,
     concurrency: int = 5,
     on_event: EventCb | None = None,
+    timeout: float | None = None,
 ) -> dict[Path, Outcome]:
+    """Run ``op`` over ``repos`` with bounded concurrency.
+
+    ``timeout`` is a per-repo limit in seconds; an operation exceeding it is cancelled
+    and reported as ``Failed``. ``None`` and ``0`` (any falsy value) mean no timeout.
+    """
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
     sem = asyncio.Semaphore(concurrency)
@@ -59,9 +65,12 @@ async def run_bulk(
                 ))
 
             try:
-                outcome = await op(repo, progress)
+                coro = op(repo, progress)
+                outcome = await (asyncio.wait_for(coro, timeout) if timeout else coro)
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                outcome = Failed(message=f"timed out after {timeout:g}s")
             except Exception as exc:  # one repo failing must not stop the others
                 outcome = Failed(message=str(exc) or type(exc).__name__)
             emit(RepoEvent(repo=str(repo), kind="done", outcome=outcome))
@@ -70,12 +79,29 @@ async def run_bulk(
     return dict(await asyncio.gather(*(one(r) for r in repos)))
 
 
+def pull_entries(outcomes: dict[Path, Outcome]) -> list[JournalEntry]:
+    return [
+        JournalEntry(repo=str(repo), op="pull", before_head=o.before_head, after_head=o.after_head)
+        for repo, o in outcomes.items()
+        if isinstance(o, Ok) and o.before_head != o.after_head
+    ]
+
+
+def record_pulls(root: Path, description: str, outcomes: dict[Path, Outcome]) -> None:
+    """Journal every pull that moved HEAD; journalling must never crash a finished pull."""
+    try:
+        Journal(root).record(description, pull_entries(outcomes))
+    except Exception:
+        log.exception("failed to write journal for %s", description)
+
+
 async def pull_repos(
     root: Path,
     repos: list[Path],
     *,
     concurrency: int = 5,
     on_event: EventCb | None = None,
+    timeout: float | None = None,
 ) -> dict[Path, Outcome]:
     collected: dict[Path, Outcome] = {}
 
@@ -86,16 +112,7 @@ async def pull_repos(
             on_event(event)
 
     try:
-        return await run_bulk(repos, pull, concurrency=concurrency, on_event=collect)
+        return await run_bulk(repos, pull, concurrency=concurrency, on_event=collect, timeout=timeout)
     finally:
         # Runs on cancellation too: every repo that moved HEAD must be undoable.
-        entries = [
-            JournalEntry(repo=str(repo), op="pull",
-                         before_head=o.before_head, after_head=o.after_head)
-            for repo, o in collected.items()
-            if isinstance(o, Ok) and o.before_head != o.after_head
-        ]
-        try:
-            Journal(root).record(f"pull {len(repos)} repos", entries)
-        except Exception:  # journaling must never turn a finished pull into a crash
-            log.exception("failed to write journal for pull of %d repos", len(repos))
+        record_pulls(root, f"pull {len(repos)} repos", collected)
