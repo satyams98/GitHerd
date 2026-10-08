@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 dependencies = ["pydantic>=2.6", "typer>=0.12", "rich>=13.7", "prompt_toolkit>=3.0.43"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "pytest-timeout>=2.3"]
 
 [project.scripts]
 githerd = "githerd.cli:app"
@@ -22,3 +22,5 @@ where = ["src"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+timeout = 300
+timeout_method = "thread"

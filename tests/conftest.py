@@ -1,3 +1,5 @@
+import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -32,24 +34,69 @@ def git():
     return _run
 
 
+@pytest.fixture(autouse=True)
+def _clean_ui_env(monkeypatch):
+    """A developer's shell must not change rendering results."""
+    for var in ("GITHERD_ASCII", "NO_COLOR", "FORCE_COLOR", "COLUMNS"):
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(scope="session")
+def _repo_template(tmp_path_factory, isolated_git):
+    """One bare remote + clone (one commit pushed, upstream set), built once.
+
+    Every make_repo() call copies these two trees, which is ~20x cheaper than
+    spawning the ~7 git processes needed to build a repo from scratch.
+    """
+    root = tmp_path_factory.mktemp("repo_template")
+    remote = root / "remotes" / "template.git"
+    remote.parent.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(remote)],
+        check=True, capture_output=True,
+    )
+    work = root / "work" / "template"
+    work.parent.mkdir(parents=True)
+    subprocess.run(
+        ["git", "clone", str(remote), str(work)], check=True, capture_output=True
+    )
+    (work / "README.md").write_text("hello\n", encoding="utf-8")
+    _run(work, "add", "README.md")
+    _run(work, "commit", "-m", "initial")
+    _run(work, "push", "-u", "origin", "main")
+    _run(work, "update-index", "--refresh")  # index stat info is up to date
+    return remote, work
+
+
+_URL_LINE = re.compile(r"^([ \t]*url[ \t]*=[ \t]*).*$", re.MULTILINE)
+
+
+def _point_origin_at(work: Path, remote: Path) -> None:
+    """Rewrite the clone's origin URL in .git/config without spawning git.
+
+    The path is written as git itself writes it (str(remote)), with backslashes
+    escaped the way git config values require.
+    """
+    cfg = work / ".git" / "config"
+    text = cfg.read_text(encoding="utf-8")
+    url = str(remote).replace("\\", "\\\\").replace('"', '\\"')
+    new, count = _URL_LINE.subn(lambda m: m.group(1) + url, text)
+    assert count == 1, f"expected exactly one remote url in {cfg}"
+    cfg.write_bytes(new.encode("utf-8"))
+
+
 @pytest.fixture
-def make_repo(tmp_path):
+def make_repo(tmp_path, _repo_template):
+    template_remote, template_work = _repo_template
+
     def make(name: str, parent: Path | None = None) -> Path:
         remote = tmp_path / "remotes" / f"{name}.git"
         remote.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "init", "--bare", "-b", "main", str(remote)],
-            check=True, capture_output=True,
-        )
+        shutil.copytree(template_remote, remote)
         work = (parent or tmp_path / "work") / name
         work.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "clone", str(remote), str(work)], check=True, capture_output=True
-        )
-        (work / "README.md").write_text("hello\n", encoding="utf-8")
-        _run(work, "add", "README.md")
-        _run(work, "commit", "-m", "initial")
-        _run(work, "push", "-u", "origin", "main")
+        shutil.copytree(template_work, work)
+        _point_origin_at(work, remote)
         return work
 
     return make
