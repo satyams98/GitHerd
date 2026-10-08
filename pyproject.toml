@@ -7,7 +7,7 @@ name = "githerd"
 version = "0.1.0"
 description = "Herd all your git repos with plain English."
 requires-python = ">=3.11"
-dependencies = ["pydantic>=2.6", "typer>=0.12"]
+dependencies = ["pydantic>=2.6", "typer>=0.12", "rich>=13.7", "prompt_toolkit>=3.0.43"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
