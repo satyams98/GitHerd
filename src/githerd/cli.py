@@ -26,7 +26,7 @@ from rich.text import Text
 
 from githerd.attention import exit_code_for, resolve_attention
 from githerd.bulk import RepoEvent, pull_repos
-from githerd.gitops import git_sync
+from githerd.gitops import git_sync, head_and_branch_sync
 from githerd.journal import Journal
 from githerd.outcomes import Ok, Outcome, describe, summarize
 from githerd.repos import discover_repos, snapshot_all
@@ -190,7 +190,7 @@ def undo(root: RootOpt = None) -> None:
         def confirm(entry, current: str) -> bool:
             name = Path(entry.repo).name
             repo = Path(entry.repo)
-            branch = entry.branch or git_sync(repo, "rev-parse", "--abbrev-ref", "HEAD") or "?"
+            branch = entry.branch or (head_and_branch_sync(repo) or ("", None))[1] or "?"
             count = git_sync(repo, "rev-list", "--count", f"{entry.after_head}..{current}")
             if count is not None and count.isdigit() and int(count) >= 1:
                 dropped = f"{count} newer commit{'' if int(count) == 1 else 's'}"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Awaitable, Callable, Literal, Mapping
 
@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from githerd.gitops import head_and_branch, head_sync, pull
 from githerd.journal import Journal, JournalEntry
-from githerd.outcomes import Failed, Ok, Outcome
+from githerd.outcomes import AuthRequired, Conflict, Failed, NetworkError, Ok, Outcome
 from githerd.runner import ProgressCb, parse_progress
 
 
@@ -28,6 +28,12 @@ log = logging.getLogger("githerd.bulk")
 EventCb = Callable[[RepoEvent], None]
 Operation = Callable[[Path, ProgressCb], Awaitable[Outcome]]
 HeadMove = tuple[str, str, str | None]  # (HEAD before, HEAD after, branch)
+
+# Overall budget (seconds) for re-reading HEADs after a pull run; see _moved_without_outcome.
+AFTER_READ_DEADLINE = 30.0
+# Outcomes of a pull that may have moved HEAD before failing; UpToDate, BlockedDirty and
+# Diverged cannot have, so their repos are never re-read.
+_MAYBE_MOVED = (Failed, NetworkError, AuthRequired, Conflict)
 
 
 def _validate_timeout(timeout: float | None) -> float | None:
@@ -136,32 +142,22 @@ def record_pulls(
         log.exception("failed to write journal for %s", description)
 
 
-async def _read_baselines(
-    repos: list[Path], concurrency: int, baseline: dict[Path, tuple[str, str | None]]
-) -> None:
-    """Fill ``baseline`` with ``(head, branch)`` per readable repo: one git spawn each, bounded."""
-    sem = asyncio.Semaphore(concurrency)
-
-    async def one(repo: Path) -> None:
-        async with sem:
-            try:
-                got = await head_and_branch(repo)
-            except Exception:  # an unreadable repo just goes unjournaled; the pull still runs
-                log.warning("could not read HEAD of %s before pulling", repo, exc_info=True)
-                return
-        if got is not None:
-            baseline[repo] = got
-
-    await asyncio.gather(*(one(r) for r in repos))
-
-
 def _moved_without_outcome(
     baseline: Mapping[Path, tuple[str, str | None]],
     collected: Mapping[Path, Outcome],
     concurrency: int,
 ) -> dict[Path, HeadMove]:
-    """Re-read HEAD (synchronously: this runs while cancelling) of every repo with no ``Ok``."""
-    todo = [r for r in baseline if not isinstance(collected.get(r), Ok)]
+    """Re-read HEAD (synchronously: this runs while cancelling) of repos that may have moved.
+
+    Only repos whose outcome is missing (cancelled) or one of Failed / NetworkError /
+    AuthRequired / Conflict are read: an ``Ok`` carries its own heads, and UpToDate,
+    BlockedDirty and Diverged cannot have moved HEAD. The whole loop is bounded by
+    ``AFTER_READ_DEADLINE`` seconds; repos not read by then are logged and left unchecked.
+    """
+    todo = [
+        r for r in baseline
+        if collected.get(r) is None or isinstance(collected[r], _MAYBE_MOVED)
+    ]
     if not todo:
         return {}
 
@@ -172,13 +168,26 @@ def _moved_without_outcome(
             log.warning("could not re-read HEAD of %s", repo, exc_info=True)
             return None
 
-    with ThreadPoolExecutor(max_workers=max(1, min(concurrency, len(todo)))) as pool:
-        afters = list(pool.map(after_head, todo))
-    return {
-        repo: (baseline[repo][0], after, baseline[repo][1])
-        for repo, after in zip(todo, afters)
-        if after and after != baseline[repo][0]
-    }
+    pool = ThreadPoolExecutor(max_workers=max(1, min(concurrency, len(todo))))
+    try:
+        futures = {repo: pool.submit(after_head, repo) for repo in todo}
+        _, pending = wait(futures.values(), timeout=AFTER_READ_DEADLINE)
+    finally:
+        # Never wait for stragglers: each git read has its own timeout and ends by itself.
+        pool.shutdown(wait=False, cancel_futures=True)
+    if pending:
+        n = len(pending)
+        log.warning(
+            "re-reading HEADs exceeded %gs; %d repo%s not checked (a pull that moved HEAD there "
+            "may be missing from the undo journal)", AFTER_READ_DEADLINE, n, "" if n == 1 else "s",
+        )
+    moves: dict[Path, HeadMove] = {}
+    for repo, future in futures.items():
+        if future not in pending:
+            after = future.result()
+            if after and after != baseline[repo][0]:
+                moves[repo] = (baseline[repo][0], after, baseline[repo][1])
+    return moves
 
 
 async def pull_repos(
@@ -189,6 +198,13 @@ async def pull_repos(
     on_event: EventCb | None = None,
     timeout: float | None = None,
 ) -> dict[Path, Outcome]:
+    """Pull every repo (bounded concurrency) and journal each pull that moved HEAD.
+
+    HEAD is compared before and after, so a pull that moved HEAD and then timed out, failed
+    or was cancelled is still undoable. A failed pull that coincides with an unrelated HEAD
+    move (the user committing concurrently) is journaled as a pull; undo only ever resets
+    when HEAD is still at the recorded after_head.
+    """
     timeout = _validate_timeout(timeout)  # fail fast, before any work or journalling
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
@@ -201,9 +217,21 @@ async def pull_repos(
         if on_event is not None:
             on_event(event)
 
+    async def read_then_pull(repo: Path, progress: ProgressCb) -> Outcome:
+        # Lazy: read inside this repo's concurrency slot, so the first repo starts at once
+        # and a hung read is covered by the per-repo timeout. A repo whose read never
+        # completed (error, timeout, cancellation) is simply not compared afterwards.
+        try:
+            got = await head_and_branch(repo)
+        except Exception:  # an unreadable repo just goes unjournaled; the pull still runs
+            log.warning("could not read HEAD of %s before pulling", repo, exc_info=True)
+            got = None
+        if got is not None:
+            baseline[repo] = got
+        return await pull(repo, progress)
+
     try:
-        await _read_baselines(repos, concurrency, baseline)
-        return await run_bulk(repos, pull, concurrency=concurrency, on_event=collect, timeout=timeout)
+        return await run_bulk(repos, read_then_pull, concurrency=concurrency, on_event=collect, timeout=timeout)
     finally:
         # Runs on cancellation too: every repo that moved HEAD must be undoable, whatever
         # the outcome (a pull can move HEAD and then time out or fail). No awaits in here.

@@ -278,7 +278,7 @@ async def test_head_and_branch_spawns_exactly_one_git(monkeypatch, make_repo):
 
     monkeypatch.setattr(githerd.gitops, "run_git", spy)
     assert await head_and_branch(repo) is not None
-    assert calls == [("rev-parse", "HEAD", "--abbrev-ref", "HEAD")]
+    assert calls == [("rev-parse", "HEAD", "--symbolic-full-name", "HEAD")]
 
 
 def test_head_sync_reads_head_and_never_raises(monkeypatch, tmp_path, make_repo, git):
@@ -300,3 +300,51 @@ def test_head_sync_reads_head_and_never_raises(monkeypatch, tmp_path, make_repo,
     assert head_sync(repo) is None
     monkeypatch.setattr(subprocess, "run", missing_git)
     assert head_sync(repo) is None
+
+
+# ---- H2 fix: unambiguous branch names ---------------------------------------------------
+
+async def test_head_and_branch_ignores_a_tag_named_like_the_branch(make_repo, git):
+    from githerd.gitops import head_and_branch
+
+    repo = make_repo("a")
+    git(repo, "tag", "main")  # `rev-parse --abbrev-ref HEAD` would print "heads/main" here
+    assert await head_and_branch(repo) == (git(repo, "rev-parse", "HEAD"), "main")
+
+
+@pytest.mark.parametrize("name", ["feature/x", "release/2026/q3", "caf\u00e9-\u65e5"])
+async def test_head_and_branch_keeps_slashes_and_unicode(make_repo, git, name):
+    from githerd.gitops import head_and_branch
+
+    repo = make_repo("a")
+    git(repo, "switch", "-c", name)
+    assert await head_and_branch(repo) == (git(repo, "rev-parse", "HEAD"), name)
+
+
+def test_head_and_branch_sync_matches_the_async_reader(make_repo, git, tmp_path):
+    from githerd.gitops import head_and_branch_sync
+
+    repo = make_repo("a")
+    git(repo, "tag", "main")
+    git(repo, "switch", "-c", "feature/\u00fc")
+    assert head_and_branch_sync(repo) == (git(repo, "rev-parse", "HEAD"), "feature/\u00fc")
+    git(repo, "checkout", "--detach")
+    assert head_and_branch_sync(repo) == (git(repo, "rev-parse", "HEAD"), None)
+    assert head_and_branch_sync(tmp_path / "missing") is None
+
+
+@pytest.mark.parametrize("stdout, expected", [
+    ("a" * 40 + "\nrefs/heads/main\n", ("a" * 40, "main")),
+    ("a" * 40 + "\nrefs/heads/feature/x\n", ("a" * 40, "feature/x")),
+    ("a" * 40 + "\nrefs/heads/caf\u00e9\n", ("a" * 40, "caf\u00e9")),
+    ("a" * 40 + "\nrefs/heads/refs/heads/odd\n", ("a" * 40, "refs/heads/odd")),  # one prefix only
+    ("a" * 40 + "\nHEAD\n", ("a" * 40, None)),
+    ("a" * 40 + "\r\nrefs/heads/main\r\n", ("a" * 40, "main")),
+    ("", None),
+    ("a" * 40 + "\n", None),
+    ("a" * 40 + "\nrefs/remotes/origin/x\n", None),  # not a local branch: unreadable, never guessed
+])
+def test_parse_head_and_branch(stdout, expected):
+    from githerd.gitops import parse_head_and_branch
+
+    assert parse_head_and_branch(stdout) == expected

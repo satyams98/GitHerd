@@ -6,6 +6,7 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel
 
+from githerd.gitops import head_and_branch
 from githerd.journal import Journal, JournalEntry, OpSet
 from githerd.runner import run_git
 from githerd.textsafe import clean_message
@@ -64,9 +65,10 @@ async def undo_last(
     """Reverse the most recent undoable operation set, repo by repo.
 
     When an entry records the ``branch`` the operation changed, the repo must still be on
-    that branch (a detached HEAD never matches): otherwise it is skipped without any
-    prompt, stays retryable, and nothing is reset, even if its HEAD still equals
-    ``after_head`` (e.g. a new branch cut at the pulled commit). Entries from old
+    that branch (a detached HEAD never matches). This gate runs FIRST, before any other
+    check: otherwise the repo is skipped without any prompt, stays retryable, and nothing
+    is reset, even if its HEAD still equals ``after_head`` (a new branch cut at the pulled
+    commit) or ``before_head`` (a hotfix branch cut at the old commit). Entries from old
     journals have no branch and skip this check.
 
     A repo whose HEAD no longer equals the recorded ``after_head`` has "moved". If it
@@ -97,12 +99,27 @@ async def undo_last(
             items.append(UndoItem(repo=entry.repo, status="skipped",
                                   detail=f"no undo available for '{entry.op}'"))
             continue
-        head_res = await run_git(repo, "rev-parse", "HEAD")
-        if not head_res.ok:
+        head = await head_and_branch(repo)  # one spawn: sha and unambiguous branch name
+        if head is None:
             items.append(UndoItem(repo=entry.repo, status="skipped",
                                   detail="repo not found or not a git repository"))
             continue
-        current = head_res.stdout.strip()
+        current, now_on = head
+        if entry.branch is not None and now_on != entry.branch:
+            # The branch gate comes first: a branch cut at the pulled (or the previous)
+            # commit is not what was pulled, and resetting it would move the wrong
+            # branch. Whatever else is true of this repo (even "already at before_head")
+            # says nothing about the recorded branch, so this stays retryable. No prompt.
+            recorded = clean_message(entry.branch)
+            if now_on is None:
+                detail = (f"repo is on a detached HEAD but the operation was on branch "
+                          f"'{recorded}'; not undone")
+            else:
+                detail = (f"repo is on branch '{clean_message(now_on)}' but the operation was on "
+                          f"'{recorded}'; not undone")
+            items.append(UndoItem(repo=entry.repo, status="skipped", detail=detail))
+            retryable.append(entry)
+            continue
         moved = current != entry.after_head
         suffix = ""
         if moved and current == entry.before_head:
@@ -110,20 +127,6 @@ async def undo_last(
             items.append(UndoItem(repo=entry.repo, status="skipped",
                                   detail=f"already at {current[:7]}"))
             continue
-        if entry.branch is not None:
-            # A branch cut at the pulled commit has the same HEAD but is not what was
-            # pulled: resetting it would move the wrong branch. Never prompt for this.
-            branch_res = await run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
-            now_on = branch_res.stdout.strip() if branch_res.ok else ""
-            if now_on != entry.branch:  # detached HEAD reads as "HEAD", never a branch name
-                if now_on:
-                    detail = (f"repo is on branch '{clean_message(now_on)}' but the operation was on "
-                              f"'{clean_message(entry.branch)}'; not undone")
-                else:
-                    detail = "cannot tell which branch the repo is on; not undone"
-                items.append(UndoItem(repo=entry.repo, status="skipped", detail=detail))
-                retryable.append(entry)
-                continue
         if moved:
             # Exit 1 = not an ancestor; anything else (e.g. object gone after a gc)
             # is equally "can't prove it is the same history".

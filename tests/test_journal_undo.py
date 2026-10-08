@@ -1,6 +1,7 @@
 import os
 import shutil
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -601,6 +602,9 @@ def _branch_detail(current, recorded):
     return f"repo is on branch '{current}' but the operation was on '{recorded}'; not undone"
 
 
+DETACHED_DETAIL = "repo is on a detached HEAD but the operation was on branch 'main'; not undone"
+
+
 async def test_undo_on_a_different_branch_at_the_same_head_is_skipped_without_prompt(
     make_repo, push_upstream, git, tmp_path
 ):
@@ -659,7 +663,7 @@ async def test_undo_with_a_detached_head_counts_as_a_different_branch(
     repo, root, journal, outcome = await _pulled_on_branch(make_repo, push_upstream, git, tmp_path)
     git(repo, "checkout", "--detach")
     _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
-    assert [(i.status, i.detail) for i in items] == [("skipped", _branch_detail("HEAD", "main"))]
+    assert [(i.status, i.detail) for i in items] == [("skipped", DETACHED_DETAIL)]
     assert git(repo, "rev-parse", "HEAD") == outcome.after_head
 
 
@@ -675,13 +679,61 @@ async def test_branch_names_in_the_skip_detail_are_cleaned(make_repo, git, tmp_p
     assert items[0].detail == _branch_detail("main", "xy")
 
 
-async def test_already_at_before_head_wins_over_the_branch_check(make_repo, push_upstream, git, tmp_path):
+async def test_same_branch_reset_to_before_head_is_already_at_and_permanent(make_repo, push_upstream, git, tmp_path):
     repo, root, journal, outcome = await _pulled_on_branch(make_repo, push_upstream, git, tmp_path)
-    git(repo, "reset", "--hard", outcome.before_head)
-    git(repo, "switch", "-c", "feature")
+    git(repo, "reset", "--hard", outcome.before_head)  # the recorded branch itself was reset
     _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
     assert [(i.status, i.detail) for i in items] == [("skipped", f"already at {outcome.before_head[:7]}")]
     assert journal.last_undoable() is None  # permanent skip: the op set is closed
+
+
+async def test_the_branch_gate_runs_before_the_already_at_check(make_repo, push_upstream, git, tmp_path):
+    repo, root, journal, outcome = await _pulled_on_branch(make_repo, push_upstream, git, tmp_path)
+    git(repo, "switch", "-c", "hotfix", outcome.before_head)  # another branch sits at before_head
+    assert git(repo, "rev-parse", "main") == outcome.after_head  # main itself was never touched
+    before = journal.last_undoable()
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [(i.status, i.detail) for i in items] == [("skipped", _branch_detail("hotfix", "main"))]
+    assert journal.last_undoable() == before  # retryable: the op set is NOT closed
+    git(repo, "switch", "main")
+    _, retry = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [i.status for i in retry] == ["restored"]
+    assert git(repo, "rev-parse", "main") == outcome.before_head
+
+
+async def test_pull_then_undo_works_when_a_tag_has_the_branch_name(make_repo, push_upstream, git, tmp_path):
+    repo = make_repo("a")
+    git(repo, "tag", "main")
+    push_upstream(repo, "new.txt")
+    root = tmp_path / "work"
+    results = await pull_repos(root, [repo])
+    outcome = results[repo]
+    assert isinstance(outcome, Ok) and outcome.branch == "main"
+    journal = Journal(root)
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [i.status for i in items] == ["restored"]  # it was refused ("heads/main") before
+    assert git(repo, "rev-parse", "HEAD") == outcome.before_head
+
+
+@pytest.mark.parametrize("name", ["feature/x", "caf\u00e9"])
+async def test_pull_then_undo_on_slash_and_unicode_branches(make_repo, push_upstream, git, tmp_path, name):
+    repo = make_repo("a")
+    git(repo, "switch", "-c", name)
+    git(repo, "push", "-u", "origin", name)
+    other_clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-b", name, git(repo, "remote", "get-url", "origin"), str(other_clone)],
+                   check=True, capture_output=True)
+    (other_clone / "up.txt").write_text("x\n", encoding="utf-8")
+    git(other_clone, "add", "-A")
+    git(other_clone, "commit", "-m", "up")
+    git(other_clone, "push", "origin", name)
+    root = tmp_path / "work"
+    results = await pull_repos(root, [repo])
+    outcome = results[repo]
+    assert isinstance(outcome, Ok) and outcome.branch == name
+    _, items = await undo_last(root, Journal(root), confirm_moved=_must_not_ask)
+    assert [i.status for i in items] == ["restored"]
+    assert git(repo, "rev-parse", "HEAD") == outcome.before_head
 
 
 async def test_the_reversal_journal_entry_keeps_the_branch(make_repo, push_upstream, git, tmp_path):

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -19,8 +18,6 @@ from githerd.ui import keys
 from githerd.ui.cards import actions_for, needs_attention, render_card
 from githerd.ui.diffview import run_diff_viewer
 from githerd.ui.theme import Glyphs
-
-log = logging.getLogger("githerd.attention")
 
 STASH_NOTE = "  if you had local changes, check 'git stash list'"
 

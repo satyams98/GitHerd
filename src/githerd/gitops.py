@@ -121,17 +121,27 @@ async def _rev(repo: Path, ref: str) -> str:
     return res.stdout.strip() if res.ok else ""
 
 
-def parse_head_branch(stdout: str) -> tuple[str, str | None] | None:
-    """Parse ``git rev-parse HEAD --abbrev-ref HEAD`` output: the sha, then the branch name.
+_HEADS = "refs/heads/"
+HEAD_AND_BRANCH_ARGS = ("rev-parse", "HEAD", "--symbolic-full-name", "HEAD")
 
-    The branch is ``None`` for a detached HEAD (git prints ``HEAD``). Unparseable output
-    gives ``None``.
+
+def parse_head_and_branch(stdout: str) -> tuple[str, str | None] | None:
+    """Parse ``git rev-parse HEAD --symbolic-full-name HEAD``: the sha, then the full ref.
+
+    The full ref (``refs/heads/<name>``) is unambiguous even when a tag has the branch's
+    name (``--abbrev-ref`` would print ``heads/<name>`` then). A detached HEAD prints
+    ``HEAD`` and yields branch ``None``. Anything else (a non-branch ref, missing lines)
+    is unparseable and gives ``None``: a branch name is never guessed.
     """
-    lines = stdout.split()
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
     if len(lines) != 2:
         return None
-    sha, branch = lines
-    return sha, (None if branch == "HEAD" else branch)
+    sha, ref = lines
+    if ref == "HEAD":
+        return sha, None
+    if ref.startswith(_HEADS) and len(ref) > len(_HEADS):
+        return sha, ref[len(_HEADS):]
+    return None
 
 
 async def head_and_branch(repo: Path) -> tuple[str, str | None] | None:
@@ -139,8 +149,8 @@ async def head_and_branch(repo: Path) -> tuple[str, str | None] | None:
 
     An unborn repo (no commits yet) or a path that is not a repo is unreadable.
     """
-    res = await run_git(repo, "rev-parse", "HEAD", "--abbrev-ref", "HEAD")
-    return parse_head_branch(res.stdout) if res.ok else None
+    res = await run_git(repo, *HEAD_AND_BRANCH_ARGS)
+    return parse_head_and_branch(res.stdout) if res.ok else None
 
 
 def git_sync(repo: Path | str, *args: str, timeout: float = 10) -> str | None:
@@ -164,6 +174,12 @@ def git_sync(repo: Path | str, *args: str, timeout: float = 10) -> str | None:
 def head_sync(repo: Path | str) -> str | None:
     """Current HEAD sha read synchronously, or ``None`` when it cannot be read."""
     return git_sync(repo, "rev-parse", "HEAD")
+
+
+def head_and_branch_sync(repo: Path | str) -> tuple[str, str | None] | None:
+    """Synchronous twin of ``head_and_branch`` (same single spawn, same parser)."""
+    out = git_sync(repo, *HEAD_AND_BRANCH_ARGS)
+    return parse_head_and_branch(out) if out else None
 
 
 async def pull(repo: Path, on_progress: ProgressCb | None = None) -> Outcome:

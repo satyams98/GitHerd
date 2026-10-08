@@ -6,7 +6,9 @@ import pytest
 from githerd import bulk
 from githerd.bulk import RepoEvent, pull_repos, run_bulk
 from githerd.journal import Journal
-from githerd.outcomes import Failed, Ok, UpToDate
+from githerd.outcomes import (
+    AuthRequired, BlockedDirty, Conflict, Diverged, Failed, NetworkError, Ok, UpToDate,
+)
 
 
 async def test_run_bulk_limits_concurrency_and_keeps_order(tmp_path):
@@ -527,7 +529,7 @@ async def test_ok_outcomes_are_journaled_without_re_reading_head(monkeypatch, ma
     monkeypatch.setattr(bulk, "head_sync", spy)
     results = await pull_repos(root, [a, c])
     assert isinstance(results[a], Ok) and results[c] == UpToDate()
-    assert reread == [c]  # only the repo without an Ok outcome is read again
+    assert reread == []  # neither an Ok nor an UpToDate outcome can need a re-read
     (entry,) = Journal(root).last_undoable().entries
     assert (entry.repo, entry.branch) == (str(a), "main")
 
@@ -543,3 +545,163 @@ def test_record_pulls_adds_head_moves_the_outcomes_do_not_carry(tmp_path):
         (str(tmp_path / "m"), "a" * 40, "b" * 40, "main"),   # the outcome wins
         (str(tmp_path / "x"), "c" * 40, "d" * 40, "dev"),
     ])
+
+
+# ---- H2 fix: lazy, bounded HEAD capture -------------------------------------------------
+
+async def test_the_first_start_fires_before_slow_baseline_reads_of_later_repos_finish(monkeypatch, tmp_path):
+    repos = [tmp_path / f"r{i}" for i in range(3)]
+    events = []
+
+    async def fake_read(repo):
+        if repo != repos[0]:
+            await asyncio.sleep(0.3)  # slow reads of the later repos
+        events.append(("read", repo))
+        return ("a" * 40, "main")
+
+    async def op(repo, progress):
+        return UpToDate()
+
+    def on_event(event):
+        if event.kind == "start":
+            events.append(("start", Path(event.repo)))
+
+    monkeypatch.setattr(bulk, "head_and_branch", fake_read)
+    monkeypatch.setattr(bulk, "pull", op)
+    monkeypatch.setattr(bulk, "head_sync", lambda repo: "a" * 40)
+    await pull_repos(tmp_path / "work", repos, on_event=on_event)
+    assert events[0] == ("start", repos[0])  # no pre-run pass: the dashboard starts at once
+    slow_done = [i for i, e in enumerate(events) if e[0] == "read" and e[1] != repos[0]]
+    first_slow_start = min(i for i, e in enumerate(events) if e[0] == "start" and e[1] != repos[0])
+    assert first_slow_start < min(slow_done)
+
+
+async def test_a_hung_baseline_read_is_covered_by_the_per_repo_timeout(monkeypatch, tmp_path):
+    a = tmp_path / "a"
+    pulled = []
+
+    async def hangs(repo):
+        await asyncio.sleep(60)
+
+    async def op(repo, progress):
+        pulled.append(repo)
+        return UpToDate()
+
+    monkeypatch.setattr(bulk, "head_and_branch", hangs)
+    monkeypatch.setattr(bulk, "pull", op)
+    results = await pull_repos(tmp_path / "work", [a], timeout=0.2)
+    assert isinstance(results[a], Failed) and "timed out" in results[a].message
+    assert pulled == []  # the pull never began, so nothing was journaled
+    assert Journal(tmp_path / "work").last_undoable() is None
+
+
+async def test_a_cancelled_baseline_read_leaves_the_repo_uncompared(monkeypatch, make_repo, push_upstream, tmp_path):
+    root = tmp_path / "work"
+    a = make_repo("a")
+    push_upstream(a, "new.txt")  # HEAD would differ from any bogus baseline if it were compared
+    started = asyncio.Event()
+
+    async def hangs(repo):
+        started.set()
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(bulk, "head_and_branch", hangs)
+    task = asyncio.create_task(pull_repos(root, [a]))
+    await asyncio.wait_for(started.wait(), timeout=30)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert Journal(root).last_undoable() is None
+
+
+@pytest.mark.parametrize("outcome, rereads", [
+    (UpToDate(), False),
+    (BlockedDirty(files=[]), False),
+    (Diverged(ahead=1, behind=1), False),
+    (Failed(message="x"), True),
+    (NetworkError(message="x"), True),
+    (AuthRequired(remote="x"), True),
+    (Conflict(files=[]), True),
+])
+async def test_only_outcomes_that_could_have_moved_head_are_re_read(monkeypatch, tmp_path, outcome, rereads):
+    a = tmp_path / "a"
+    reread = []
+
+    async def fake_read(repo):
+        return ("a" * 40, "main")
+
+    async def op(repo, progress):
+        return outcome
+
+    def spy(repo):
+        reread.append(repo)
+        return "a" * 40
+
+    monkeypatch.setattr(bulk, "head_and_branch", fake_read)
+    monkeypatch.setattr(bulk, "pull", op)
+    monkeypatch.setattr(bulk, "head_sync", spy)
+    await pull_repos(tmp_path / "work", [a])
+    assert reread == ([a] if rereads else [])
+
+
+async def test_a_repo_without_an_outcome_is_re_read(monkeypatch, tmp_path):
+    a = tmp_path / "a"
+    started = asyncio.Event()
+    reread = []
+
+    async def fake_read(repo):
+        return ("a" * 40, "main")
+
+    async def op(repo, progress):
+        started.set()
+        await asyncio.sleep(60)
+
+    def spy(repo):
+        reread.append(repo)
+        return "b" * 40
+
+    monkeypatch.setattr(bulk, "head_and_branch", fake_read)
+    monkeypatch.setattr(bulk, "pull", op)
+    monkeypatch.setattr(bulk, "head_sync", spy)
+    root = tmp_path / "work"
+    task = asyncio.create_task(pull_repos(root, [a]))
+    await asyncio.wait_for(started.wait(), timeout=30)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert reread == [a]
+    (entry,) = Journal(root).last_undoable().entries
+    assert (entry.before_head, entry.after_head, entry.branch) == ("a" * 40, "b" * 40, "main")
+
+
+async def test_the_after_read_loop_has_an_overall_deadline(monkeypatch, tmp_path, caplog):
+    import logging
+    import time
+
+    repos = [tmp_path / f"r{i}" for i in range(4)]
+
+    async def fake_read(repo):
+        return ("a" * 40, "main")
+
+    async def fails(repo, progress):
+        return Failed(message="x")
+
+    def slow(repo):
+        time.sleep(0.6)
+        return "b" * 40
+
+    monkeypatch.setattr(bulk, "head_and_branch", fake_read)
+    monkeypatch.setattr(bulk, "pull", fails)
+    monkeypatch.setattr(bulk, "head_sync", slow)
+    monkeypatch.setattr(bulk, "AFTER_READ_DEADLINE", 0.1)
+    start = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="githerd.bulk"):
+        results = await pull_repos(tmp_path / "work", repos, concurrency=1)
+    assert time.monotonic() - start < 0.5  # gave up at the deadline, not after 4 slow reads
+    assert all(isinstance(o, Failed) for o in results.values())
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "4 repos" in messages and "not checked" in messages
+
+
+def test_the_after_read_deadline_default_is_thirty_seconds():
+    assert bulk.AFTER_READ_DEADLINE == 30.0
