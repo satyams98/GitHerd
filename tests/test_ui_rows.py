@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -221,3 +222,55 @@ def test_render_status_wide_name_keeps_columns_aligned():
     prefix0 = lines[0][: lines[0].index("main")]
     prefix1 = lines[1][: lines[1].index("main")]
     assert cell_len(prefix0) == cell_len(prefix1)
+
+
+def test_render_status_separates_sync_and_changes_without_upstream():
+    plain = render_status([_snap("alpha", branch="main")], ASCII_GLYPHS).plain
+    assert "no upstream  clean" in plain
+    assert "no upstreamclean" not in plain
+
+
+def test_render_status_separates_sync_counts_and_changes():
+    snap = _snap("alpha", branch="main", upstream="origin/main", ahead=1, behind=2)
+    assert "^1 v2  clean" in render_status([snap], ASCII_GLYPHS).plain
+    dirty = _snap("beta", branch="main", upstream="origin/main", ahead=1, behind=2,
+                  dirty=[FileChange(status=" M", path="a.txt")])
+    assert "^1 v2  1 changed" in render_status([dirty], ASCII_GLYPHS).plain
+
+
+def test_render_status_changes_column_aligned_for_any_sync_width():
+    snaps = [
+        _snap("a", branch="main", upstream="origin/main", ahead=1, behind=2),
+        _snap("b", branch="main"),
+        _snap("c", branch="main", upstream="origin/main", ahead=123, behind=45,
+              dirty=[FileChange(status=" M", path="a.txt")]),
+        _snap("d", branch="main", upstream="origin/main"),
+        _snap("e", branch="main", dirty=[FileChange(status=" M", path="a.txt"),
+                                          FileChange(status=" M", path="b.txt")]),
+    ]
+    for glyphs in (ASCII_GLYPHS, UNICODE_GLYPHS):
+        lines = render_status(snaps, glyphs).plain.splitlines()
+        assert len(lines) == 5
+        starts = set()
+        for line in lines:
+            match = re.search(r"(clean|\d+ changed)$", line)
+            assert match, line
+            assert line[match.start() - 2: match.start()] == "  "
+            starts.add(cell_len(line[: match.start()]))
+        assert len(starts) == 1, lines
+
+
+def test_render_status_changes_never_glued_to_sync_text():
+    snaps = [_snap("a", branch="main"), _snap("b", branch="main", upstream="o/m", ahead=1000, behind=1000)]
+    for line in render_status(snaps, ASCII_GLYPHS).plain.splitlines():
+        assert "upstreamclean" not in line and "v1000clean" not in line
+
+
+def test_render_status_name_cap_default_and_none():
+    long_name = "n" * 40
+    capped = render_status([_snap(long_name, branch="main")], ASCII_GLYPHS).plain
+    assert long_name not in capped and "..." in capped
+    uncapped = render_status([_snap(long_name, branch="main")], ASCII_GLYPHS, max_name_width=None).plain
+    assert long_name in uncapped
+    wide = render_status([_snap(long_name, branch="main")], ASCII_GLYPHS, max_name_width=10).plain
+    assert long_name not in wide

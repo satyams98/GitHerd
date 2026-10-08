@@ -118,9 +118,20 @@ def render_row(
     return line
 
 
-def render_status(snaps: list[RepoSnapshot], glyphs: Glyphs) -> Text:
-    name_w = min(24, max((cell_len(s.name) for s in snaps), default=0))
+def _sync_text(snap: RepoSnapshot, glyphs: Glyphs) -> str:
+    if not snap.upstream:
+        return "no upstream"
+    return f"{glyphs.ahead}{snap.ahead} {glyphs.behind}{snap.behind}"
+
+
+def render_status(
+    snaps: list[RepoSnapshot], glyphs: Glyphs, *, max_name_width: int | None = 24
+) -> Text:
+    """One line per repo. ``max_name_width=None`` never truncates names (plain, piped output)."""
+    longest_name = max((cell_len(s.name) for s in snaps), default=0)
+    name_w = longest_name if max_name_width is None else min(max_name_width, longest_name)
     branch_w = min(16, max((cell_len(s.branch or "(detached)") for s in snaps), default=0))
+    sync_w = max((cell_len(_sync_text(s, glyphs)) for s in snaps if not s.error), default=0)
     out = Text()
     for index, snap in enumerate(snaps):
         if index:
@@ -133,11 +144,11 @@ def render_status(snaps: list[RepoSnapshot], glyphs: Glyphs) -> Text:
             continue
         glyph, style = (glyphs.attn, "warn") if snap.dirty else (glyphs.ok, "ok")
         branch = snap.branch or "(detached)"
-        sync = f"{glyphs.ahead}{snap.ahead} {glyphs.behind}{snap.behind}" if snap.upstream else "no upstream"
         changes = f"{len(snap.dirty)} changed" if snap.dirty else "clean"
         out.append(f"{glyph} ", style=style)
         out.append(_pad(fit(snap.name, name_w, glyphs), name_w), style="subject")
         out.append("  " + _pad(fit(branch, branch_w, glyphs), branch_w), style="dim")
-        out.append("  " + _pad(sync, 11), style="dim")
+        out.append("  " + _pad(_sync_text(snap, glyphs), sync_w), style="dim")
+        out.append("  ")  # columns are always separated, whatever the sync text width
         out.append(changes, style=style if snap.dirty else "dim")
     return out

@@ -6,11 +6,13 @@ Exit codes (``pull``):
 * 1   usage or environment problem (git missing, no repositories found).
 * 2   at least one repo still needs attention (blocked, diverged, conflict, auth, failure).
       Typer/click also use 2 for a command-line usage error such as ``--timeout 0``.
+      ``undo`` also exits 2 when any repo was skipped or failed to restore.
 * 130 interrupted with Ctrl+C (journalling of finished repos has already run).
 """
 from __future__ import annotations
 
 import asyncio
+import math
 import shutil
 import sys
 from contextlib import contextmanager
@@ -86,20 +88,34 @@ def _interactive(console: Console) -> bool:
     return console.is_terminal and sys.stdin.isatty()
 
 
+def _finite_timeout(value: float) -> float:
+    if not math.isfinite(value) or value < 1:
+        raise typer.BadParameter("timeout must be a finite number of seconds >= 1")
+    return value
+
+
 @app.command()
 def status(root: RootOpt = None) -> None:
     """Show branch, sync state and local changes for every repo."""
     console = make_console()
     _, repos = _repos(root)
-    snaps = asyncio.run(snapshot_all(repos))
-    console.print(render_status(snaps, glyphs_for(console)))
+    with _interrupts(console):
+        snaps = asyncio.run(snapshot_all(repos))
+    if console.is_terminal:
+        console.print(render_status(snaps, glyphs_for(console)))
+    else:
+        # Piped output: one unwrapped, untruncated line per repo.
+        console.print(render_status(snaps, glyphs_for(console), max_name_width=None), soft_wrap=True)
 
 
 @app.command()
 def pull(
     root: RootOpt = None,
     jobs: Annotated[int, typer.Option("--jobs", "-j", min=1, help="Parallel repos.")] = 5,
-    timeout: Annotated[float, typer.Option("--timeout", min=1, help="Seconds allowed per repo.")] = 300.0,
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=1, callback=_finite_timeout, help="Seconds allowed per repo."),
+    ] = 300.0,
 ) -> None:
     """Pull every repo in parallel (fast-forward only).
 
@@ -141,7 +157,14 @@ def pull(
 
 @app.command()
 def undo(root: RootOpt = None) -> None:
-    """Undo the last operation (e.g. a bulk pull)."""
+    """Undo the last operation (e.g. a bulk pull).
+
+    
+    Exit codes:
+      0  every repo was restored, or there was nothing to undo
+      2  at least one repo was skipped or failed to restore
+      130  interrupted with Ctrl+C
+    """
     console = make_console()
     glyphs = glyphs_for(console)
     base = _base(root)
@@ -155,6 +178,7 @@ def undo(root: RootOpt = None) -> None:
                 command=f"git reset --keep {entry.before_head[:7]}  ({name})",
                 repos=[name],
                 glyphs=glyphs,
+                read_line=lambda prompt: input(prompt),  # looked up per call, not bound at import
                 detail=f"{name} has newer commits; they are dropped from the branch (kept in the reflog)",
             )
 
@@ -179,6 +203,8 @@ def undo(root: RootOpt = None) -> None:
         if item.detail:
             line.append(f": {item.detail}", style="dim")
         console.print(line)
+    if any(item.status != "restored" for item in items):
+        raise typer.Exit(code=2)
 
 
 if __name__ == "__main__":

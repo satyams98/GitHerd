@@ -1,6 +1,9 @@
+import asyncio
 import io
+import signal
 import subprocess
 
+import pytest
 from typer.testing import CliRunner
 
 from githerd import cli
@@ -35,7 +38,7 @@ def test_status_shows_only_the_first_error_line(tmp_path):
     assert result.exit_code == 0, result.output
     assert "x broken" in result.output and "error:" in result.output
     assert "Traceback" not in result.output
-    assert len([ln for ln in result.output.splitlines() if "broken" in ln]) >= 1
+    assert len([ln for ln in result.output.splitlines() if "broken" in ln]) == 1
 
 
 def test_pull_exit_code_is_2_when_a_repo_needs_attention_non_interactive(make_repo, push_upstream, tmp_path):
@@ -184,3 +187,186 @@ def test_pull_help_documents_exit_codes():
     assert "Exit codes" in result.output
     for code in ("0", "2", "130"):
         assert code in result.output
+
+
+# ---- review fixes -------------------------------------------------------------
+
+def _fake_snapshots(monkeypatch, snaps):
+    async def fake(repos):
+        return snaps
+
+    monkeypatch.setattr(cli, "snapshot_all", fake)
+
+
+def test_status_separates_sync_and_changes_columns(make_repo, push_upstream, tmp_path):
+    a = make_repo("alpha")
+    make_repo("beta")
+    push_upstream(a, "x.txt")
+    subprocess.run(["git", "-C", str(a), "fetch"], check=True, capture_output=True)
+    (a / "scratch.txt").write_text("s\n", encoding="utf-8")
+    result = runner.invoke(app, ["status", "--root", str(tmp_path / "work")])
+    assert result.exit_code == 0, result.output
+    assert "v1  1 changed" in result.output
+    assert "upstreamclean" not in result.output and "changedclean" not in result.output
+
+
+def test_status_without_upstream_is_separated_from_changes(tmp_path, git):
+    repo = tmp_path / "solo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    result = runner.invoke(app, ["status", "--root", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "no upstream  clean" in result.output
+
+
+def test_plain_status_is_one_unwrapped_line_per_repo_with_full_names(make_repo, monkeypatch, tmp_path):
+    long_name = "r" * 40
+    make_repo(long_name)
+    make_repo("short")
+    (tmp_path / "work" / "broken" / ".git").mkdir(parents=True)
+    from githerd.repos import RepoSnapshot
+
+    real = cli.snapshot_all
+
+    async def with_long_error(repos):
+        snaps = await real(repos)
+        return [
+            RepoSnapshot(path=s.path, name=s.name, error="fatal: " + "boom " * 60) if s.name == "broken" else s
+            for s in snaps
+        ]
+
+    monkeypatch.setattr(cli, "snapshot_all", with_long_error)
+    result = runner.invoke(app, ["status", "--root", str(tmp_path / "work")])
+    assert result.exit_code == 0, result.output
+    lines = [ln for ln in result.output.splitlines() if ln.strip()]
+    assert len(lines) == 3, result.output
+    assert any(long_name in ln and "..." not in ln for ln in lines)
+    broken = [ln for ln in lines if "broken" in ln]
+    assert len(broken) == 1 and broken[0].rstrip().endswith("boom")  # not wrapped at 80 columns
+    assert len(broken[0]) > 80
+
+
+def test_terminal_status_still_caps_long_names(make_repo, monkeypatch, tmp_path):
+    console = _terminal(monkeypatch)
+    long_name = "r" * 40
+    make_repo(long_name)
+    result = runner.invoke(app, ["status", "--root", str(tmp_path / "work")])
+    assert result.exit_code == 0, result.output
+    text = console.export_text()
+    assert long_name not in text and "r" * 20 in text
+
+
+def test_ctrl_c_during_status_exits_130(make_repo, monkeypatch, tmp_path):
+    make_repo("a")
+    monkeypatch.setattr(cli, "snapshot_all", _interrupting)
+    result = runner.invoke(app, ["status", "--root", str(tmp_path / "work")])
+    assert result.exit_code == 130
+    assert "Interrupted." in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("value", ["inf", "nan"])
+def test_non_finite_timeout_is_a_usage_error(tmp_path, value):
+    result = runner.invoke(app, ["pull", "--root", str(tmp_path), "--timeout", value])
+    assert result.exit_code == 2, result.output
+    assert "Traceback" not in result.output
+    unboxed = result.output.replace("│", " ")  # typer draws errors in a box that wraps the text
+    assert "timeout must be a finite number of seconds >= 1" in " ".join(unboxed.split())
+
+
+def test_negative_infinite_timeout_is_a_usage_error(tmp_path):
+    result = runner.invoke(app, ["pull", "--root", str(tmp_path), "--timeout", "-inf"])
+    assert result.exit_code == 2 and "Traceback" not in result.output
+
+
+def test_undo_exit_code_is_0_when_nothing_to_undo(make_repo, tmp_path):
+    make_repo("a")
+    result = runner.invoke(app, ["undo", "--root", str(tmp_path / "work")])
+    assert result.exit_code == 0
+    assert "Nothing to undo." in result.output
+
+
+def test_undo_exit_code_is_2_when_a_moved_repo_is_skipped(make_repo, push_upstream, commit_local, tmp_path):
+    root = tmp_path / "work"
+    a = make_repo("a")
+    push_upstream(a, "new.txt")
+    assert runner.invoke(app, ["pull", "--root", str(root)]).exit_code == 0
+    commit_local(a, "mine.txt")
+    result = runner.invoke(app, ["undo", "--root", str(root)])
+    assert result.exit_code == 2, result.output
+    assert "skipped" in result.output
+
+
+def test_undo_exit_code_is_2_when_a_repo_fails(make_repo, monkeypatch, tmp_path):
+    from githerd.journal import OpSet
+    from githerd.undo import UndoItem
+
+    async def fake_undo(root, journal, **kwargs):
+        op = OpSet(id="x", description="pull 1 repos", timestamp="t", entries=[])
+        return op, [UndoItem(repo=str(tmp_path / "a"), status="failed", detail="boom")]
+
+    make_repo("a")
+    monkeypatch.setattr(cli, "undo_last", fake_undo)
+    result = runner.invoke(app, ["undo", "--root", str(tmp_path / "work")])
+    assert result.exit_code == 2, result.output
+    assert "failed" in result.output
+
+
+def test_undo_help_documents_exit_codes():
+    result = runner.invoke(app, ["undo", "--help"])
+    assert result.exit_code == 0
+    assert "Exit codes" in result.output
+    assert "0" in result.output and "2" in result.output
+
+
+def _pulled_and_moved(make_repo, push_upstream, commit_local, git, runner_, root):
+    a = make_repo("a")
+    before = git(a, "rev-parse", "HEAD")
+    push_upstream(a, "new.txt")
+    assert runner_.invoke(app, ["pull", "--root", str(root)]).exit_code == 0
+    commit_local(a, "mine.txt")
+    return a, before
+
+
+def test_interactive_undo_confirmed_resets_a_moved_repo(
+    make_repo, push_upstream, commit_local, git, monkeypatch, tmp_path
+):
+    console = _terminal(monkeypatch)
+    root = tmp_path / "work"
+    a, before = _pulled_and_moved(make_repo, push_upstream, commit_local, git, runner, root)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    result = runner.invoke(app, ["undo", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert git(a, "rev-parse", "HEAD") == before
+    text = console.export_text()
+    assert f"git reset --keep {before[:7]}" in text
+    assert "(a)" in text and "restored" in text
+
+
+def test_interactive_undo_declined_leaves_the_repo_and_exits_2(
+    make_repo, push_upstream, commit_local, git, monkeypatch, tmp_path
+):
+    console = _terminal(monkeypatch)
+    root = tmp_path / "work"
+    a, before = _pulled_and_moved(make_repo, push_upstream, commit_local, git, runner, root)
+    moved_head = git(a, "rev-parse", "HEAD")
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    result = runner.invoke(app, ["undo", "--root", str(root)])
+    assert result.exit_code == 2, result.output
+    assert git(a, "rev-parse", "HEAD") == moved_head != before
+    text = console.export_text()
+    assert "git reset --keep" in text and "skipped" in text
+
+
+def test_real_sigint_during_plain_pull_exits_130(make_repo, monkeypatch, tmp_path):
+    make_repo("a")
+
+    async def sigint_then_wait(*args, **kwargs):
+        signal.raise_signal(signal.SIGINT)
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(cli, "pull_repos", sigint_then_wait)
+    result = runner.invoke(app, ["pull", "--root", str(tmp_path / "work")])
+    assert result.exit_code == 130, result.output
+    assert "Interrupted." in result.output
+    assert "Traceback" not in result.output
