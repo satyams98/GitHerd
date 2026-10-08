@@ -233,6 +233,15 @@ def head_and_branch_sync(repo: Path | str) -> tuple[str, str | None] | None:
     return parse_head_and_branch(out) if out else None
 
 
+PULL_ARGS = ("pull", "--ff-only", "--progress")
+# What the bulk pull runs, shown (dim) under the dashboard; built from PULL_ARGS so the two cannot drift.
+PULL_COMMAND = "git " + " ".join(PULL_ARGS)
+# The attention actions show these (dim) before running them: a retry is the same pull, and
+# authenticating is an interactive fetch.
+PULL_FF_COMMAND = "git pull --ff-only"
+FETCH_COMMAND = "git fetch"
+
+
 async def pull(repo: Path, on_progress: ProgressCb | None = None) -> Outcome:
     try:
         return await _pull(repo, on_progress)
@@ -250,7 +259,7 @@ async def _pull(repo: Path, on_progress: ProgressCb | None) -> Outcome:
             retryable=False,
         )
     before = snap.head
-    res = await run_git(repo, "pull", "--ff-only", "--progress", on_progress=on_progress)
+    res = await run_git(repo, *PULL_ARGS, on_progress=on_progress)
     if not res.ok:
         low = res.stderr.lower()
         if "would be overwritten" in low:

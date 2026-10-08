@@ -289,3 +289,63 @@ def test_row_and_status_lines_print_no_control_or_bidi_characters_from_a_repo_na
     assert "\x1b" not in status and "\u202e" not in status and "evil" in status
     broken = render_status([_snap(EVIL_NAME, error="boom")], ASCII_GLYPHS).plain
     assert "\x1b" not in broken and "\u202e" not in broken and "evil" in broken
+
+
+# ---- H6 item 4: terminal status error lines are width-fitted ------------------------------------
+
+LONG_ERROR = "fatal: " + "boom " * 60
+
+
+@pytest.mark.parametrize("glyphs", [UNICODE_GLYPHS, ASCII_GLYPHS], ids=["unicode", "ascii"])
+@pytest.mark.parametrize("width", [0, 1, 2, 5, 10, 17, 30, 40, 80])
+def test_a_width_fitted_error_line_is_one_line_within_the_width(width, glyphs):
+    plain = render_status([_snap("broken", error=LONG_ERROR)], glyphs, width=width).plain
+    assert "\n" not in plain
+    assert cell_len(plain) <= width
+    if width >= 10:
+        assert plain.endswith(glyphs.ellipsis)
+
+
+def test_a_width_fitted_error_line_keeps_its_prefix_and_shows_the_marker():
+    plain = render_status([_snap("broken", error=LONG_ERROR)], ASCII_GLYPHS, width=40).plain
+    assert plain.startswith("x broken  error: fatal: boom") and plain.endswith("...")
+    assert cell_len(plain) == 40
+
+
+def test_an_error_line_that_fits_is_left_whole():
+    plain = render_status([_snap("broken", error="fatal: boom")], ASCII_GLYPHS, width=80).plain
+    assert plain == "x broken  error: fatal: boom"
+
+
+def test_without_a_width_error_lines_are_never_cut():
+    plain = render_status([_snap("broken", error=LONG_ERROR)], ASCII_GLYPHS, max_name_width=None).plain
+    assert cell_len(plain) > 200 and "..." not in plain
+
+
+def test_width_fitting_leaves_healthy_lines_alone():
+    snaps = [_snap("alpha", branch="main", upstream="origin/main"), _snap("broken", error=LONG_ERROR)]
+    fitted = render_status(snaps, ASCII_GLYPHS, width=40).plain.splitlines()
+    whole = render_status(snaps, ASCII_GLYPHS).plain.splitlines()
+    assert fitted[0] == whole[0]
+    assert cell_len(fitted[1]) <= 40
+
+
+# ---- H6 item 6: labels for duplicate repo names ----------------------------------------------------
+
+def _snap_at(path, **kw) -> RepoSnapshot:
+    path = Path(path)
+    return RepoSnapshot(path=path, name=path.name, **kw)
+
+
+def test_render_status_uses_labels_for_duplicate_names():
+    a, b = _snap_at("/w/team-a/api", branch="main"), _snap_at("/w/team-b/api", branch="main")
+    labels = {a.path: "team-a/api", b.path: "team-b/api"}
+    lines = render_status([a, b], ASCII_GLYPHS, labels=labels).plain.splitlines()
+    assert lines[0].startswith("+ team-a/api") and lines[1].startswith("+ team-b/api")
+
+
+def test_render_status_labels_apply_to_error_lines_and_default_to_the_name():
+    a = _snap_at("/w/team-a/api", error="boom")
+    b = _snap_at("/w/docs", branch="main")
+    lines = render_status([a, b], ASCII_GLYPHS, labels={a.path: "team-a/api"}).plain.splitlines()
+    assert lines[0].startswith("x team-a/api") and lines[1].startswith("+ docs")

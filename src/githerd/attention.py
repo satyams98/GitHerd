@@ -10,10 +10,10 @@ from rich.text import Text
 from githerd.asyncutil import run_coro_sync
 from githerd.diffs import FileDiff, file_diff
 from githerd.bulk import HeadMove, record_pulls, validate_timeout
-from githerd.gitops import head_and_branch, pull
+from githerd.gitops import FETCH_COMMAND, PULL_FF_COMMAND, head_and_branch, pull
 from githerd.interactive import run_git_interactive
 from githerd.outcomes import BlockedDirty, Failed, FileChange, Outcome, describe
-from githerd.recover import auto_stash_present, stash_and_pull
+from githerd.recover import STASH_PULL_COMMAND, auto_stash_present, stash_and_pull, stash_tip
 from githerd.textsafe import clean_message, safe_path
 from githerd.ui import keys
 from githerd.ui.cards import actions_for, needs_attention, render_card
@@ -95,24 +95,38 @@ def _note(console: Console, text: str) -> None:
     console.print(Text(text, style="dim"))
 
 
+def _command_note(console: Console, command: str) -> None:
+    """Quietly show the real git command an action is about to run."""
+    _note(console, f"    $ {command}")
+
+
+def _stash_tip_before(repo: Path) -> str | None:
+    """``refs/stash`` before an action, or ``None`` when it cannot be read (never raises)."""
+    try:
+        return asyncio.run(asyncio.wait_for(stash_tip(repo), 10))
+    except Exception:  # an unreadable tip only makes the later check less exact
+        return None
+
+
 def _resolve_one(
     console: Console, repo: Path, outcome: Outcome, glyphs: Glyphs,
     read_key: Callable[[], str], viewer: Viewer, heads: Heads,
-    *, more: bool = False, timeout: float | None = None,
+    *, more: bool = False, timeout: float | None = None, label: str | None = None,
 ) -> tuple[Outcome, bool]:
     """Offer actions for one repo until it is settled; returns ``(outcome, stop)``.
 
     ``more`` says other repos still need attention (it enables ``skip all``); ``stop`` is
     True when the user chose ``skip all``, so the caller must leave the rest untouched.
+    ``label`` is how the repo is named on screen (default: its directory name).
     """
-    label = safe_path(repo.name)
+    label = safe_path(label if label is not None else repo.name)
 
     def authenticate() -> Outcome:
         run_git_interactive(repo, "fetch")  # git talks to the user (not timed); we never see credentials
         return asyncio.run(_bounded(pull(repo), timeout))
 
     while needs_attention(outcome):
-        console.print(render_card(repo.name, outcome, glyphs))
+        console.print(render_card(label, outcome, glyphs))
         action = keys.choose_action(console, actions_for(outcome, more=more), glyphs, read_key)
         if action.id == "skip_all":
             return outcome, True
@@ -130,11 +144,18 @@ def _resolve_one(
             continue
         if action.id == "stash_pull":
             _note(console, f"  stashing, pulling, restoring {label}...")
+            _command_note(console, STASH_PULL_COMMAND)
+            before_tip = _stash_tip_before(repo)
 
             async def stash_left() -> str:
                 # A timeout cancelled the work, and the restore after the cancel may not have
-                # happened: say so when our auto-stash is still there.
-                if not await auto_stash_present(repo):
+                # happened: say so when a NEW auto-stash (made by this action, not an older
+                # stranded one) is still there. Without a baseline any auto-stash counts.
+                present = (
+                    await auto_stash_present(repo) if before_tip is None
+                    else await auto_stash_present(repo, before_tip)
+                )
+                if not present:
                     return ""
                 _note(console, STASH_NOTE)
                 return STASH_KEPT_SUFFIX
@@ -149,9 +170,11 @@ def _resolve_one(
                 raise
         elif action.id == "auth":
             _note(console, f"  running git fetch for {label} (git may ask for credentials)...")
+            _command_note(console, FETCH_COMMAND)
             outcome = _mutate(repo, heads, authenticate)
         else:  # retry
             _note(console, f"  pulling {label}...")
+            _command_note(console, PULL_FF_COMMAND)
             outcome = _mutate(repo, heads, lambda: asyncio.run(_bounded(pull(repo), timeout)))
         _note(console, f"  {describe(outcome)}")
     return outcome, False
@@ -166,13 +189,15 @@ def resolve_attention(
     read_key: Callable[[], str] | None = None,
     viewer: Viewer = _default_viewer,
     timeout: float | None = None,
+    labels: dict[Path, str] | None = None,
 ) -> dict[Path, Outcome]:
     """Walk the repos that need attention, offering one card each, and return the final outcomes.
 
     ``timeout`` (seconds, ``None``/``0`` = none; negative or non-finite raises ``ValueError``
     up front) limits each pull or stash-and-pull action the user starts; the interactive
-    authenticate hand-off is never timed. When a timeout leaves our auto-stash in
-    ``git stash``, the card says so. Choosing
+    authenticate hand-off is never timed. When a timeout leaves a NEW auto-stash made by
+    that action in ``git stash``, the card says so. ``labels`` (repo path -> text) names
+    repos on screen where the directory name is ambiguous. Choosing
     ``skip all`` leaves the current and every remaining repo as they are.
 
     This runs its own event loops (``asyncio.run``) and blocks on the keyboard, so it must
@@ -187,7 +212,7 @@ def resolve_attention(
         for index, repo in enumerate(pending):
             final[repo], stop = _resolve_one(
                 console, repo, results[repo], glyphs, reader, viewer, heads,
-                more=index + 1 < len(pending), timeout=timeout,
+                more=index + 1 < len(pending), timeout=timeout, label=(labels or {}).get(repo),
             )
             if stop:
                 break

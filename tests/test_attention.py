@@ -747,3 +747,185 @@ def test_two_files_walked_with_n_then_q_load_each_once_inside_the_running_loop(
     assert sorted(loaded) == ["x.txt", "y.txt"]  # each file exactly once
     (state,) = states
     assert "upstream" not in state.text and "local" in state.text
+
+
+# ---- H5 item 2: the feedback lines quietly show the real git command ----------------------------
+
+STASH_PULL_CMD = "    $ git stash push --include-untracked ; git pull --ff-only ; git stash pop"
+RETRY_CMD = "    $ git pull --ff-only"
+AUTH_CMD = "    $ git fetch"
+
+
+def test_the_command_constants_live_next_to_the_code_that_runs_them():
+    assert recover.STASH_PULL_COMMAND == STASH_PULL_CMD.strip()[2:]
+    from githerd import gitops
+
+    assert gitops.PULL_FF_COMMAND == RETRY_CMD.strip()[2:]
+    assert gitops.FETCH_COMMAND == AUTH_CMD.strip()[2:]
+
+
+def test_retry_shows_its_command_under_the_pulling_line(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    console = make()
+    _fast(monkeypatch, "pull", UpToDate())
+    resolve_attention(console, tmp_path, {repo: Failed(message="x")}, ASCII_GLYPHS, read_key=keys("r"))
+    lines = console.file.getvalue().splitlines()
+    assert lines[lines.index("  pulling a...") + 1] == RETRY_CMD
+
+
+def test_stash_and_pull_shows_its_command_under_the_feedback_line(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    console = make()
+    _fast(monkeypatch, "stash_and_pull", UpToDate())
+    resolve_attention(console, tmp_path, {repo: BlockedDirty(files=[])}, ASCII_GLYPHS, read_key=keys("s"))
+    lines = console.file.getvalue().splitlines()
+    assert lines[lines.index("  stashing, pulling, restoring a...") + 1] == STASH_PULL_CMD
+
+
+def test_authenticate_shows_its_command_before_handing_off(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    console = make()
+    seen = []
+    monkeypatch.setattr(
+        attention, "run_git_interactive", lambda r, *a: seen.append(console.file.getvalue()) or 0,
+    )
+    _fast(monkeypatch, "pull", UpToDate())
+    resolve_attention(
+        console, tmp_path, {repo: AuthRequired(remote="origin")}, ASCII_GLYPHS, read_key=keys("a"),
+    )
+    lines = seen[0].splitlines()
+    assert lines[lines.index("  running git fetch for a (git may ask for credentials)...") + 1] == AUTH_CMD
+
+
+def test_the_command_lines_are_dim_ascii_and_one_line_each(make_repo, monkeypatch, tmp_path):
+    from rich.console import Console
+
+    from githerd.ui.theme import THEME
+
+    repo = make_repo("a")
+    console = Console(
+        file=io.StringIO(), width=120, force_terminal=True, color_system="standard", record=True,
+        theme=THEME, highlight=False,
+    )
+    _fast(monkeypatch, "stash_and_pull", UpToDate())
+    resolve_attention(console, tmp_path, {repo: BlockedDirty(files=[])}, ASCII_GLYPHS, read_key=keys("s"))
+    styled = console.export_text(styles=True)
+    assert "\x1b[2m" + STASH_PULL_CMD in styled
+    assert STASH_PULL_CMD.isascii()
+
+
+# ---- H6 item 6: labels for duplicate repo names ---------------------------------------------------------
+
+def test_labels_name_the_repo_in_the_card_and_in_the_feedback(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    console = make()
+    _fast(monkeypatch, "pull", UpToDate())
+    resolve_attention(
+        console, tmp_path, {repo: Failed(message="x")}, ASCII_GLYPHS,
+        read_key=keys("r"), labels={repo: "team-a/a"},
+    )
+    out = console.file.getvalue()
+    assert "x team-a/a | failed: x" in out  # the card heading
+    assert "  pulling team-a/a..." in out
+    assert "  pulling a..." not in out
+
+
+def test_labels_are_used_for_the_stash_and_auth_feedback_too(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    console = make()
+    monkeypatch.setattr(attention, "run_git_interactive", lambda r, *a: 0)
+    _fast(monkeypatch, "stash_and_pull", UpToDate())
+    _fast(monkeypatch, "pull", UpToDate())
+    labels = {repo: "team-a/a"}
+    resolve_attention(
+        console, tmp_path, {repo: BlockedDirty(files=[])}, ASCII_GLYPHS, read_key=keys("s"), labels=labels,
+    )
+    resolve_attention(
+        console, tmp_path, {repo: AuthRequired(remote="origin")}, ASCII_GLYPHS, read_key=keys("a"), labels=labels,
+    )
+    out = console.file.getvalue()
+    assert "  stashing, pulling, restoring team-a/a..." in out
+    assert "  running git fetch for team-a/a (git may ask for credentials)..." in out
+
+
+def test_a_label_is_sanitised_and_missing_labels_fall_back_to_the_name(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    other = make_repo("b")
+    console = make()
+    _fast(monkeypatch, "pull", UpToDate())
+    resolve_attention(
+        console, tmp_path, {repo: Failed(message="x"), other: Failed(message="y")}, ASCII_GLYPHS,
+        read_key=keys("r", "r"), labels={repo: f"evil{chr(0x202E)}\x1b[2Jname"},
+    )
+    out = console.file.getvalue()
+    assert "  pulling evil?name..." in out and "  pulling b..." in out
+    assert "\x1b" not in out and chr(0x202E) not in out
+
+
+# ---- H9: the timeout note is exact -----------------------------------------------------------------------
+
+def _older_githerd_stash(repo, git):
+    (repo / "README.md").write_text("an older stranded change\n", encoding="utf-8")
+    git(repo, "stash", "push", "-m", recover.STASH_MESSAGE)
+    assert recover.STASH_MESSAGE in git(repo, "stash", "list")
+
+
+def _blocked_with_older_stash(make_repo, push_upstream, git):
+    repo = make_repo("a")
+    _older_githerd_stash(repo, git)
+    (repo / "README.md").write_text("local edit\n", encoding="utf-8")
+    push_upstream(repo, "README.md", content="upstream edit\n")
+    outcome = asyncio.run(pull(repo))
+    assert isinstance(outcome, BlockedDirty)
+    return repo, outcome
+
+
+def test_an_older_stranded_stash_does_not_trigger_the_note_when_ours_was_restored(
+    make_repo, push_upstream, git, monkeypatch, tmp_path
+):
+    repo, outcome = _blocked_with_older_stash(make_repo, push_upstream, git)
+    monkeypatch.setattr(recover, "pull", _hangs)  # stash push works, then the pull never finishes
+    console = make()
+    final = resolve_attention(
+        console, tmp_path, {repo: outcome}, ASCII_GLYPHS, read_key=keys("s", "k"), timeout=2,
+    )
+    assert final[repo] == Failed(message="timed out after 2s")  # no stash suffix
+    assert STASH_NOTE not in console.file.getvalue()
+    assert (repo / "README.md").read_text(encoding="utf-8") == "local edit\n"  # ours was put back
+    assert len(git(repo, "stash", "list").splitlines()) == 1  # only the older one is left
+
+
+def test_a_new_stash_left_behind_still_triggers_the_note_when_an_older_one_exists(
+    make_repo, push_upstream, git, monkeypatch, tmp_path
+):
+    repo, outcome = _blocked_with_older_stash(make_repo, push_upstream, git)
+    monkeypatch.setattr(recover, "pull", _hangs)
+
+    async def restore_fails(repo, before):
+        return None
+
+    monkeypatch.setattr(recover, "_restore_after_interrupt", restore_fails)
+    console = make()
+    final = resolve_attention(
+        console, tmp_path, {repo: outcome}, ASCII_GLYPHS, read_key=keys("s", "k"), timeout=2,
+    )
+    assert final[repo] == Failed(message="timed out after 2s" + KEPT_SUFFIX)
+    assert STASH_NOTE in console.file.getvalue()
+    assert len(git(repo, "stash", "list").splitlines()) == 2
+
+
+def test_an_unreadable_stash_tip_before_the_action_falls_back_to_the_old_check(
+    make_repo, push_upstream, git, monkeypatch, tmp_path
+):
+    repo, outcome = _blocked_with_older_stash(make_repo, push_upstream, git)
+    monkeypatch.setattr(recover, "pull", _hangs)
+
+    async def no_tip(repo):
+        raise RuntimeError("git exploded")
+
+    monkeypatch.setattr(attention, "stash_tip", no_tip)
+    console = make()
+    resolve_attention(
+        console, tmp_path, {repo: outcome}, ASCII_GLYPHS, read_key=keys("s", "k"), timeout=2,
+    )
+    assert STASH_NOTE in console.file.getvalue()  # unsure, so err on the side of telling the user

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import shutil
 import sys
 from contextlib import contextmanager
@@ -26,8 +27,9 @@ from rich.text import Text
 
 from githerd.attention import exit_code_for, resolve_attention
 from githerd.bulk import RepoEvent, pull_repos
-from githerd.gitops import git_sync, head_and_branch_sync
+from githerd.gitops import PULL_COMMAND, git_sync, head_and_branch_sync
 from githerd.journal import Journal
+from githerd.names import display_names
 from githerd.outcomes import Ok, Outcome, describe, summarize
 from githerd.repos import discover_repos, snapshot_all
 from githerd.textsafe import clean_message, safe_path
@@ -35,7 +37,7 @@ from githerd.ui.confirm import confirm_destructive
 from githerd.ui.dashboard import Dashboard, LiveDashboard
 from githerd.ui.rows import render_status
 from githerd.ui.theme import glyphs_for, make_console
-from githerd.undo import undo_last
+from githerd.undo import UndoItem, undo_last
 
 app = typer.Typer(
     add_completion=False,
@@ -92,6 +94,13 @@ def _interactive(console: Console) -> bool:
 
 
 UNDO_HINT = "undo available: githerd undo"
+_BACK_TO = re.compile(r"^back to ([0-9a-fA-F]{4,40})(?![0-9a-fA-F])")
+
+
+def _restored_sha(item: UndoItem) -> str | None:
+    """The short sha a restored item went back to (from its ``back to <sha>`` detail), if any."""
+    match = _BACK_TO.match(item.detail) if item.status == "restored" else None
+    return match.group(1) if match else None
 
 
 def _moved_any(results: dict[str, Outcome] | dict[Path, Outcome]) -> bool:
@@ -109,14 +118,19 @@ def _finite_timeout(value: float) -> float:
 def status(root: RootOpt = None) -> None:
     """Show branch, sync state and local changes for every repo."""
     console = make_console()
-    _, repos = _repos(root)
+    base, repos = _repos(root)
     with _interrupts(console):
         snaps = asyncio.run(snapshot_all(repos))
+    labels = display_names(repos, base)
     if console.is_terminal:
-        console.print(render_status(snaps, glyphs_for(console)))
+        # Error lines are fitted to the terminal width so that none wraps.
+        console.print(render_status(snaps, glyphs_for(console), labels=labels, width=console.width))
     else:
         # Piped output: one unwrapped, untruncated line per repo.
-        console.print(render_status(snaps, glyphs_for(console), max_name_width=None), soft_wrap=True)
+        console.print(
+            render_status(snaps, glyphs_for(console), max_name_width=None, labels=labels),
+            soft_wrap=True,
+        )
 
 
 @app.command()
@@ -139,25 +153,30 @@ def pull(
     console = make_console()
     glyphs = glyphs_for(console)
     base, repos = _repos(root)
+    labels = display_names(repos, base)
     with _interrupts(console):
         if _interactive(console):
             snaps = asyncio.run(snapshot_all(repos))
-            branches = {str(s.path): s.branch or "(detached)" for s in snaps}
-            dashboard = Dashboard(repos, branches, glyphs, title="Pulling")
+            # A repo whose snapshot errored has no readable branch: "?" rather than "(detached)".
+            branches = {str(s.path): s.branch or ("?" if s.error else "(detached)") for s in snaps}
+            dashboard = Dashboard(
+                repos, branches, glyphs, title="Pulling", command=PULL_COMMAND, labels=labels,
+            )
             with LiveDashboard(console, dashboard) as live:
                 results = asyncio.run(
                     pull_repos(base, repos, concurrency=jobs, timeout=timeout, on_event=live.on_event)
                 )
             console.print(Text(summarize(results.values()), style="subject"))
-            results = resolve_attention(console, base, results, glyphs, timeout=timeout)
+            results = resolve_attention(console, base, results, glyphs, timeout=timeout, labels=labels)
             if _moved_any(results):
                 console.print(Text(UNDO_HINT, style="dim"))
         else:
-            width = max(cell_len(safe_path(r.name)) for r in repos)
+            width = max(cell_len(labels[r]) for r in repos)
 
             def on_event(event: RepoEvent) -> None:
                 if event.kind == "done" and event.outcome is not None:
-                    name = safe_path(Path(event.repo).name)
+                    repo = Path(event.repo)
+                    name = labels.get(repo) or safe_path(repo.name)
                     typer.echo(f"{name + ' ' * max(0, width - cell_len(name))}  {describe(event.outcome)}")
 
             results = asyncio.run(
@@ -186,7 +205,8 @@ def undo(root: RootOpt = None) -> None:
     base = _base(root)
 
     confirm = None
-    if _interactive(console):
+    interactive = _interactive(console)
+    if interactive:
         def confirm(entry, current: str) -> bool:
             name = Path(entry.repo).name
             repo = Path(entry.repo)
@@ -212,21 +232,30 @@ def undo(root: RootOpt = None) -> None:
     if op_set is None:
         console.print("Nothing to undo.")
         return
-    console.print(Text(f"Undoing: {clean_message(op_set.description)}", style="subject"))
+    # Piped output: one unwrapped line per item (a terminal wraps as it always did).
+    wrap = {} if console.is_terminal else {"soft_wrap": True}
+    console.print(Text(f"Undoing: {clean_message(op_set.description)}", style="subject"), **wrap)
     styles = {
         "restored": (glyphs.ok, "ok"),
         "skipped": (glyphs.attn, "warn"),
         "failed": (glyphs.fail, "error"),
     }
+    paths = list(dict.fromkeys(
+        [Path(e.repo) for e in op_set.entries] + [Path(item.repo) for item in items]
+    ))
+    labels = display_names(paths, base)
     for item in items:
         glyph, style = styles[item.status]
         line = Text()
         line.append(f"{glyph} ", style=style)
-        line.append(safe_path(Path(item.repo).name), style="subject")
+        line.append(labels[Path(item.repo)], style="subject")
         line.append(f"  {item.status}", style=style)
         if item.detail:
             line.append(f": {clean_message(item.detail)}", style="dim")
-        console.print(line)
+        console.print(line, **wrap)
+        sha = _restored_sha(item) if interactive else None
+        if sha:
+            console.print(Text(f"    $ git reset --keep {sha}", style="dim"), **wrap)
     if any(item.status != "restored" for item in items):
         raise typer.Exit(code=2)
 

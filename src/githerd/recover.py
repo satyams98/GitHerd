@@ -11,6 +11,8 @@ from githerd.runner import ProgressCb, git_env, run_git
 from githerd.textsafe import clean_message
 
 STASH_MESSAGE = "githerd: auto-stash before pull"
+# What stash_and_pull runs, shown (dim) before the action; keep it in step with the code below.
+STASH_PULL_COMMAND = "git stash push --include-untracked ; git pull --ff-only ; git stash pop"
 
 log = logging.getLogger("githerd.recover")
 
@@ -29,18 +31,32 @@ async def _conflicted_files(repo: Path) -> list[str]:
     return [p for p in res.stdout.split("\0") if p]
 
 
-async def _stash_tip(repo: Path) -> str:
+async def stash_tip(repo: Path) -> str:
+    """The commit at the top of ``git stash`` (``refs/stash``), or ``""`` when there is no stash."""
     res = await run_git(repo, "rev-parse", "--verify", "--quiet", "refs/stash")
     return res.stdout.strip() if res.ok else ""
 
 
-async def auto_stash_present(repo: Path) -> bool:
+async def _new_auto_stash_on_top(repo: Path, before: str) -> bool:
+    if await stash_tip(repo) in ("", before):
+        return False  # no stash, or still the one that was on top before the action
+    res = await run_git(repo, "stash", "list", "--max-count=1")  # the new top entry
+    return res.ok and STASH_MESSAGE in res.stdout
+
+
+async def auto_stash_present(repo: Path, before: str | None = None) -> bool:
     """True when our auto-stash is still listed in ``git stash``; never raises.
 
     Used after a timeout cancelled a stash-and-pull, where the restore may not have happened.
     A git failure (or a hung git: bounded to 10 s) counts as "not present".
+
+    ``before`` is ``stash_tip`` as read BEFORE the action (``""`` for no stash). When given,
+    only a stash made since then counts, so an older stranded one is not mistaken for ours;
+    without it any stash with our message counts.
     """
     try:
+        if before is not None:
+            return await asyncio.wait_for(_new_auto_stash_on_top(repo, before), 10)
         res = await asyncio.wait_for(run_git(repo, "stash", "list"), 10)
     except Exception:  # includes TimeoutError and GitError; cancellation still propagates
         return False
@@ -77,7 +93,7 @@ async def _restore_after_interrupt(repo: Path, before: str) -> None:
     before we pushed, so an older stash of the user's is never popped by mistake.
     """
     try:
-        tip = await _stash_tip(repo)
+        tip = await stash_tip(repo)
         if tip and tip != before:
             await run_git(repo, "stash", "pop")
         return
@@ -107,13 +123,13 @@ async def stash_and_pull(repo: Path, on_progress: ProgressCb | None = None) -> O
     before: str | None = None  # stash tip before we pushed; None until it is known
     settled = False  # the pop below has run, so there is nothing left to rescue
     try:
-        before = await _stash_tip(repo)
+        before = await stash_tip(repo)
         stash = await run_git(repo, "stash", "push", "--include-untracked", "-m", STASH_MESSAGE)
         if not stash.ok:
             return Failed(message=f"could not stash local changes: {_last_line(stash.stderr)}")
         # Compare the stash tip rather than parsing git's wording; an older user
         # stash must never be popped when there was nothing to save.
-        stash_pending = await _stash_tip(repo) != before
+        stash_pending = await stash_tip(repo) != before
         outcome = await pull(repo, on_progress)
         if not stash_pending:
             return outcome

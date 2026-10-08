@@ -11,7 +11,7 @@ from rich.text import Text
 
 from githerd.bulk import RepoEvent
 from githerd.runner import parse_progress
-from githerd.textsafe import safe_path
+from githerd.textsafe import clean_message, safe_path
 from githerd.ui.rows import RowState, bar, fit, render_row
 from githerd.ui.theme import Glyphs
 
@@ -27,12 +27,18 @@ class Dashboard:
         *,
         title: str = "Pulling",
         clock: Callable[[], float] = time.monotonic,
+        command: str | None = None,
+        labels: dict[Path, str] | None = None,
     ) -> None:
+        """``command`` (e.g. ``git pull --ff-only --progress``) is shown dim as the last line;
+        ``labels`` (repo path -> text) replaces the directory name in a row."""
         self.glyphs = glyphs
         self.title = title
+        self.command = command
         self._clock = clock
+        names = labels or {}
         self.rows: dict[str, RowState] = {
-            str(r): RowState(path=str(r), name=r.name, branch=branches.get(str(r), ""))
+            str(r): RowState(path=str(r), name=names.get(r, r.name), branch=branches.get(str(r), ""))
             for r in repos
         }
 
@@ -72,6 +78,11 @@ class Dashboard:
         head.append(right, style="accent")
         return head
 
+    def _command_line(self, width: int) -> Text:
+        """The command, dim, right-aligned within ``width`` cells and never longer than one line."""
+        shown = fit(clean_message(f"$ {self.command}"), width, self.glyphs)
+        return Text(" " * (width - cell_len(shown)) + shown, style="dim")
+
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         width = max(options.max_width, 0)
         yield self._header(width)
@@ -79,6 +90,8 @@ class Dashboard:
         branch_w = min(16, max((cell_len(r.branch) for r in self.rows.values()), default=0))
         for row in self.rows.values():
             yield render_row(row, self.glyphs, name_w=name_w, branch_w=branch_w, width=width)
+        if self.command:
+            yield self._command_line(width)
 
 
 class LiveDashboard:

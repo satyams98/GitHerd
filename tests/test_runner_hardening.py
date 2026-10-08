@@ -357,3 +357,41 @@ async def test_a_descendant_holding_the_pipes_cannot_hang_a_capped_read(tmp_path
 async def test_a_negative_stdout_cap_is_rejected_before_spawning(tmp_path):
     with pytest.raises(ValueError, match="max_stdout_bytes"):
         await run_git(tmp_path, "--version", max_stdout_bytes=-1)
+
+
+# ---- H8: cancelling during the post-kill settle phase leaves no task behind ----------------------
+
+def _pending_discard_tasks():
+    return [
+        t for t in asyncio.all_tasks()
+        if not t.done() and getattr(t.get_coro(), "__qualname__", "") == "_discard"
+    ]
+
+
+async def test_cancelling_during_the_post_kill_settle_leaves_no_discard_task(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner, "KILL_SETTLE_SECONDS", 60.0)  # a long window: we cancel inside it
+    yes_marker, sleep_marker = tmp_path / "yes.pid", tmp_path / "sleep.pid"
+    script = (  # an orphaned `yes` floods stdout; `sleep` keeps stderr open; both outlive git
+        f"!(yes & cat /proc/$!/winpid > {yes_marker.as_posix()}); "
+        f"sleep 100 & cat /proc/$!/winpid > {sleep_marker.as_posix()}; wait"
+    )
+    task = asyncio.create_task(
+        run_git(tmp_path, "-c", f"alias.spam={script}", "spam", max_stdout_bytes=64_000)
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not _pending_discard_tasks():  # git was killed and the settle phase has begun
+            assert not task.done(), "run_git finished before the settle phase could be observed"
+            assert time.monotonic() < deadline, "the settle phase never started"
+            await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        deadline = time.monotonic() + 3  # a short grace period for the cancellation to land
+        while _pending_discard_tasks() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert _pending_discard_tasks() == [], "the _discard task outlived the cancelled run_git"
+    finally:
+        task.cancel()
+        await _kill_marked(yes_marker, "yes.exe")
+        await _kill_marked(sleep_marker, "sleep.exe")

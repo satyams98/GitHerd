@@ -358,3 +358,55 @@ async def test_auto_stash_present_never_raises(monkeypatch, tmp_path):
 
     monkeypatch.setattr(githerd.recover, "run_git", boom)
     assert await auto_stash_present(tmp_path) is False
+
+
+# ---- H9: an exact "was a NEW stash left behind?" check ---------------------------------------------
+
+async def test_stash_tip_is_empty_without_a_stash_and_the_top_entry_with_one(make_repo, git):
+    from githerd.recover import stash_tip
+
+    repo = make_repo("a")
+    assert await stash_tip(repo) == ""
+    (repo / "README.md").write_text("one\n", encoding="utf-8")
+    git(repo, "stash", "push", "-m", "first")
+    first = await stash_tip(repo)
+    assert first == git(repo, "rev-parse", "refs/stash")
+    (repo / "README.md").write_text("two\n", encoding="utf-8")
+    git(repo, "stash", "push", "-m", "second")
+    assert await stash_tip(repo) not in ("", first)
+
+
+async def test_auto_stash_present_with_a_before_tip_only_counts_a_stash_made_since(make_repo, git):
+    from githerd.recover import STASH_MESSAGE, auto_stash_present, stash_tip
+
+    repo = make_repo("a")
+    (repo / "README.md").write_text("older\n", encoding="utf-8")
+    git(repo, "stash", "push", "-m", STASH_MESSAGE)  # stranded long ago
+    before = await stash_tip(repo)
+    assert await auto_stash_present(repo) is True  # without a baseline any such stash counts
+    assert await auto_stash_present(repo, before) is False  # but nothing new was made
+    (repo / "README.md").write_text("new\n", encoding="utf-8")
+    git(repo, "stash", "push", "-m", STASH_MESSAGE)
+    assert await auto_stash_present(repo, before) is True
+
+
+async def test_auto_stash_present_with_a_before_tip_ignores_a_new_stash_that_is_not_ours(make_repo, git):
+    from githerd.recover import auto_stash_present, stash_tip
+
+    repo = make_repo("a")
+    before = await stash_tip(repo)  # no stash at all yet: ""
+    (repo / "README.md").write_text("mine\n", encoding="utf-8")
+    git(repo, "stash", "push", "-m", "somebody else's stash")
+    assert await auto_stash_present(repo, before) is False
+
+
+async def test_auto_stash_present_with_a_before_tip_never_raises(monkeypatch, tmp_path):
+    from githerd.recover import auto_stash_present
+
+    assert await auto_stash_present(tmp_path / "missing", "abc") is False
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("git exploded")
+
+    monkeypatch.setattr(githerd.recover, "run_git", boom)
+    assert await auto_stash_present(tmp_path, "abc") is False

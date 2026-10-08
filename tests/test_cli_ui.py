@@ -509,3 +509,276 @@ def test_pull_passes_the_default_timeout_when_none_is_given(make_repo, monkeypat
     make_repo("a")
     assert runner.invoke(app, ["pull", "--root", str(tmp_path / "work")]).exit_code == 0
     assert seen["timeout"] == 300.0
+
+
+# ---- H5: the real git command is shown quietly, on an interactive terminal only ------------------
+
+PULL_COMMAND = "git pull --ff-only --progress"
+
+
+def _styled_terminal(monkeypatch):
+    """Like ``_terminal`` but with colour support, so ``export_text(styles=True)`` shows styles."""
+    from rich.console import Console
+
+    from githerd.ui.theme import THEME
+
+    console = Console(
+        file=io.StringIO(), width=100, force_terminal=True, color_system="standard", record=True,
+        theme=THEME, highlight=False, emoji=False,
+    )
+    monkeypatch.setattr(cli, "make_console", lambda: console)
+    monkeypatch.setattr(cli, "_interactive", lambda c: True)
+    return console
+
+
+def test_interactive_pull_shows_the_pull_command_under_the_dashboard(make_repo, push_upstream, monkeypatch, tmp_path):
+    console = _styled_terminal(monkeypatch)
+    root = tmp_path / "work"
+    push_upstream(make_repo("a"), "n.txt")
+    make_repo("b")
+    assert runner.invoke(app, ["pull", "--root", str(root)]).exit_code == 0
+    plain = console.export_text(clear=False)
+    assert "$ " + PULL_COMMAND in plain
+    assert "\x1b[2m" in console.export_text(styles=True)  # drawn dim
+
+
+def test_plain_pull_output_has_no_command_lines(make_repo, push_upstream, tmp_path):
+    root = tmp_path / "work"
+    push_upstream(make_repo("a"), "n.txt")
+    make_repo("b")
+    result = runner.invoke(app, ["pull", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "$" not in result.output and PULL_COMMAND not in result.output
+    assert len([ln for ln in result.output.splitlines() if ln.strip()]) == 4
+
+
+def test_plain_pull_with_a_blocked_repo_still_prints_no_command_lines(make_repo, push_upstream, tmp_path):
+    root = tmp_path / "work"
+    a = make_repo("a")
+    (a / "README.md").write_text("local edit\n", encoding="utf-8")
+    push_upstream(a, "README.md", content="upstream edit\n")
+    result = runner.invoke(app, ["pull", "--root", str(root)])
+    assert result.exit_code == 2
+    assert "$ git" not in result.output
+
+
+def test_interactive_undo_shows_the_reset_command_under_each_restored_item(
+    make_repo, push_upstream, git, monkeypatch, tmp_path
+):
+    root = tmp_path / "work"
+    a = make_repo("a")
+    before = git(a, "rev-parse", "HEAD")
+    push_upstream(a, "new.txt")
+    assert runner.invoke(app, ["pull", "--root", str(root)]).exit_code == 0
+    console = _styled_terminal(monkeypatch)
+    result = runner.invoke(app, ["undo", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    command = f"    $ git reset --keep {before[:7]}"
+    lines = console.export_text(clear=False).splitlines()
+    (index,) = [i for i, ln in enumerate(lines) if "restored" in ln]
+    assert lines[index + 1] == command
+    assert "\x1b[2m" + command in console.export_text(styles=True)
+
+
+def test_interactive_undo_shows_no_command_for_a_skipped_item(
+    make_repo, push_upstream, commit_local, git, monkeypatch, tmp_path
+):
+    console = _terminal(monkeypatch)
+    root = tmp_path / "work"
+    _pulled_and_moved(make_repo, push_upstream, commit_local, git, runner, root)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    assert runner.invoke(app, ["undo", "--root", str(root)]).exit_code == 2
+    assert "    $ git reset --keep" not in console.export_text()  # only the confirmation names it
+
+
+def test_interactive_undo_skips_the_command_line_when_there_is_no_sha(monkeypatch, tmp_path):
+    from githerd.journal import OpSet
+    from githerd.undo import UndoItem
+
+    async def fake_undo(root, journal, **kwargs):
+        op = OpSet(id="x", description="pull 1 repos", timestamp="t", entries=[])
+        return op, [UndoItem(repo=str(tmp_path / "a"), status="restored", detail="")]
+
+    console = _terminal(monkeypatch)
+    monkeypatch.setattr(cli, "undo_last", fake_undo)
+    assert runner.invoke(app, ["undo", "--root", str(tmp_path)]).exit_code == 0
+    text = console.export_text()
+    assert "restored" in text and "$ git" not in text
+
+
+def test_plain_undo_output_has_no_command_lines(make_repo, push_upstream, tmp_path):
+    root = tmp_path / "work"
+    push_upstream(make_repo("a"), "new.txt")
+    runner.invoke(app, ["pull", "--root", str(root)])
+    result = runner.invoke(app, ["undo", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "restored" in result.output and "$" not in result.output
+
+
+# ---- H6 item 4: terminal status error lines never wrap ------------------------------------------
+
+def test_terminal_status_error_lines_are_fitted_to_the_width(monkeypatch, tmp_path):
+    from rich.cells import cell_len
+
+    from githerd.repos import RepoSnapshot
+
+    console = _terminal(monkeypatch)
+    (tmp_path / "broken" / ".git").mkdir(parents=True)
+
+    async def long_error(repos):
+        return [RepoSnapshot(path=repos[0], name="broken", error="fatal: " + "boom " * 60)]
+
+    monkeypatch.setattr(cli, "snapshot_all", long_error)
+    result = runner.invoke(app, ["status", "--root", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    lines = [ln for ln in console.export_text().splitlines() if ln.strip()]
+    assert len(lines) == 1, lines
+    assert cell_len(lines[0]) <= 100 and "broken" in lines[0]
+    assert lines[0].rstrip().endswith(("…", "..."))
+
+
+# ---- H6 item 5: a snapshot that errored shows '?' as its branch --------------------------------------
+
+def test_dashboard_branch_is_a_question_mark_for_a_repo_whose_snapshot_errored(monkeypatch, tmp_path):
+    console = _terminal(monkeypatch)
+    monkeypatch.setattr("githerd.ui.keys.read_key", iter(["k", "k", "k"]).__next__)
+    (tmp_path / "broken" / ".git").mkdir(parents=True)  # looks like a repo, is not one
+    result = runner.invoke(app, ["pull", "--root", str(tmp_path)])
+    assert result.exit_code == 2, result.output
+    text = console.export_text()
+    assert "(detached)" not in text
+    assert any("broken  ?  " in ln for ln in text.splitlines()), text  # the dashboard row's branch column
+
+
+# ---- H6 item 6: duplicate repo names are told apart ------------------------------------------------------
+
+def _duplicate_repos(tmp_path):
+    repos = [tmp_path / "team-a" / "api", tmp_path / "b" / "api", tmp_path / "docs"]
+    for repo in repos:
+        (repo / ".git").mkdir(parents=True)
+    return repos
+
+
+def test_plain_pull_lines_use_relative_paths_for_duplicate_names(monkeypatch, tmp_path):
+    from githerd.bulk import RepoEvent
+    from githerd.outcomes import UpToDate, describe
+
+    repos = _duplicate_repos(tmp_path)
+    monkeypatch.setattr(cli, "_repos", lambda root: (tmp_path, repos))
+
+    async def fake_pull_repos(base, repos, *, concurrency=5, on_event=None, timeout=None):
+        for repo in repos:
+            on_event(RepoEvent(repo=str(repo), kind="done", outcome=UpToDate()))
+        return {repo: UpToDate() for repo in repos}
+
+    monkeypatch.setattr(cli, "pull_repos", fake_pull_repos)
+    result = runner.invoke(app, ["pull", "--root", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    done = describe(UpToDate())
+    lines = [ln for ln in result.output.splitlines() if ln.endswith(done)]
+    assert lines == [f"team-a/api  {done}", f"b/api       {done}", f"docs        {done}"]
+
+
+def test_plain_pull_lines_for_unique_names_are_unchanged(monkeypatch, tmp_path):
+    from githerd.bulk import RepoEvent
+    from githerd.outcomes import UpToDate, describe
+
+    repos = [tmp_path / "team-a" / "api", tmp_path / "docs"]
+    monkeypatch.setattr(cli, "_repos", lambda root: (tmp_path, repos))
+
+    async def fake_pull_repos(base, repos, *, concurrency=5, on_event=None, timeout=None):
+        for repo in repos:
+            on_event(RepoEvent(repo=str(repo), kind="done", outcome=UpToDate()))
+        return {repo: UpToDate() for repo in repos}
+
+    monkeypatch.setattr(cli, "pull_repos", fake_pull_repos)
+    result = runner.invoke(app, ["pull", "--root", str(tmp_path)])
+    done = describe(UpToDate())
+    assert [ln for ln in result.output.splitlines() if ln.endswith(done)] == [
+        f"api   {done}", f"docs  {done}",
+    ]
+
+
+def test_status_uses_relative_paths_for_duplicate_names(tmp_path):
+    _duplicate_repos(tmp_path)
+    result = runner.invoke(app, ["status", "--root", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert any(ln.startswith("x team-a/api") for ln in lines)
+    assert any(ln.startswith("x b/api") for ln in lines)
+    assert any(ln.startswith("x docs") for ln in lines)
+
+
+def test_interactive_dashboard_shows_relative_paths_for_duplicate_names(monkeypatch, tmp_path):
+    from githerd.bulk import RepoEvent
+    from githerd.outcomes import UpToDate
+
+    console = _terminal(monkeypatch)
+    repos = _duplicate_repos(tmp_path)
+    monkeypatch.setattr(cli, "_repos", lambda root: (tmp_path, repos))
+
+    async def fake_pull_repos(base, repos, *, concurrency=5, on_event=None, timeout=None):
+        for repo in repos:
+            on_event(RepoEvent(repo=str(repo), kind="start"))
+            on_event(RepoEvent(repo=str(repo), kind="done", outcome=UpToDate()))
+        return {repo: UpToDate() for repo in repos}
+
+    monkeypatch.setattr(cli, "pull_repos", fake_pull_repos)
+    assert runner.invoke(app, ["pull", "--root", str(tmp_path)]).exit_code == 0
+    text = console.export_text()
+    assert "team-a/api" in text and "b/api" in text and "docs" in text
+
+
+def test_pull_hands_the_labels_to_the_attention_loop(monkeypatch, tmp_path):
+    _terminal(monkeypatch)
+    seen = _capture_resolve(monkeypatch)
+    repos = _duplicate_repos(tmp_path)
+    monkeypatch.setattr(cli, "_repos", lambda root: (tmp_path, repos))
+    assert runner.invoke(app, ["pull", "--root", str(tmp_path)]).exit_code in (0, 2)
+    assert seen["labels"] == {repos[0]: "team-a/api", repos[1]: "b/api", repos[2]: "docs"}
+
+
+def test_undo_output_uses_relative_paths_for_duplicate_names(monkeypatch, tmp_path):
+    from githerd.journal import JournalEntry, OpSet
+    from githerd.undo import UndoItem
+
+    repos = _duplicate_repos(tmp_path)
+
+    async def fake_undo(root, journal, **kwargs):
+        op = OpSet(id="x", description="pull 3 repos", timestamp="t", entries=[
+            JournalEntry(repo=str(r), op="pull", before_head="a" * 40, after_head="b" * 40) for r in repos
+        ])
+        return op, [UndoItem(repo=str(r), status="restored", detail=f"back to {'a' * 7}") for r in repos]
+
+    monkeypatch.setattr(cli, "undo_last", fake_undo)
+    result = runner.invoke(app, ["undo", "--root", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert any(ln.startswith("+ team-a/api  restored") for ln in lines)
+    assert any(ln.startswith("+ b/api  restored") for ln in lines)
+    assert any(ln.startswith("+ docs  restored") for ln in lines)
+
+
+# ---- H6 item 7: plain undo lines never wrap at 80 columns ---------------------------------------------------
+
+def test_plain_undo_lines_do_not_wrap_at_80_columns(monkeypatch, tmp_path):
+    from githerd.journal import OpSet
+    from githerd.undo import UndoItem
+
+    long_dir = "r" * 70
+    detail = "repo is on branch 'feature' but the operation was on 'main'; not undone"
+
+    async def fake_undo(root, journal, **kwargs):
+        op = OpSet(id="x", description="pull 2 repos", timestamp="t", entries=[])
+        return op, [
+            UndoItem(repo=str(tmp_path / long_dir), status="skipped", detail=detail),
+            UndoItem(repo=str(tmp_path / "b"), status="restored", detail="back to 1234567"),
+        ]
+
+    monkeypatch.setattr(cli, "undo_last", fake_undo)
+    result = runner.invoke(app, ["undo", "--root", str(tmp_path)])
+    assert result.exit_code == 2, result.output
+    lines = [ln for ln in result.output.splitlines() if ln.strip()]
+    assert len(lines) == 3, result.output  # the heading plus one line per item
+    skipped = [ln for ln in lines if long_dir in ln]
+    assert len(skipped) == 1 and skipped[0].endswith("not undone") and len(skipped[0]) > 80

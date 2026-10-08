@@ -261,3 +261,80 @@ def test_dashboard_row_for_a_hostile_repo_name_has_no_control_characters_and_ali
     assert len(lines) == 2
     assert lines[0].index("queued") == lines[1].index("queued")  # widths use the cleaned names
     assert lines[0].split()[1] == "evil?name"  # safe_path shows the override as ?
+
+
+# ---- H5 item 1: the real git command, shown quietly ------------------------------------------
+
+COMMAND = "git pull --ff-only --progress"
+
+
+def make_dashboard_with_command(glyphs=ASCII_GLYPHS):
+    repos = [Path("/w/api"), Path("/w/billing"), Path("/w/docs")]
+    return Dashboard(repos, {}, glyphs, command=COMMAND)
+
+
+def test_the_pull_command_constant_is_the_command_that_runs():
+    from githerd import gitops
+
+    assert gitops.PULL_COMMAND == COMMAND
+    assert gitops.PULL_COMMAND.split()[:2] == ["git", "pull"]
+
+
+def test_a_dashboard_without_a_command_has_no_command_line():
+    dash, _ = make_dashboard()
+    text = render_plain(dash)
+    assert "$ git" not in text
+    assert len(text.split("\n")[:-1]) == 4
+
+
+def test_the_command_is_one_extra_last_line_right_aligned_within_the_width():
+    lines = render_plain(make_dashboard_with_command(), 80).split("\n")[:-1]
+    assert len(lines) == 1 + 3 + 1
+    shown = "$ " + COMMAND
+    assert lines[-1] == " " * (80 - len(shown)) + shown
+
+
+def test_the_command_line_is_dim():
+    console = make_console(io.StringIO(), width=80)
+    parts = list(make_dashboard_with_command().__rich_console__(console, console.options))
+    assert parts[-1].plain.strip() == "$ " + COMMAND
+    assert parts[-1].style == "dim"
+
+
+@pytest.mark.parametrize("glyphs", [UNICODE_GLYPHS, ASCII_GLYPHS], ids=["unicode", "ascii"])
+@pytest.mark.parametrize("width", [*range(0, 41), 80])
+def test_the_command_line_never_wraps_at_any_width(width, glyphs):
+    text = render_plain(make_dashboard_with_command(glyphs), width)
+    if width == 0:
+        assert text == ""
+        return
+    lines = text.split("\n")[:-1]
+    assert len(lines) == 1 + 3 + 1  # stable frame height: header, rows, command
+    assert all(cell_len(line) <= width for line in lines)
+    if glyphs is ASCII_GLYPHS:
+        assert text.isascii()
+
+
+def test_the_command_survives_in_the_final_live_frame():
+    console = make_console(io.StringIO(), width=80, force_terminal=True, record=True)
+    dash = make_dashboard_with_command()
+    with LiveDashboard(console, dash) as live:
+        live.on_event(ev("api", "start"))
+        live.on_event(ev("api", "done", outcome=UpToDate()))
+    assert "$ " + COMMAND in console.export_text()
+
+
+# ---- H6 item 6: labels for duplicate repo names ------------------------------------------------
+
+def test_labels_replace_the_directory_name_in_the_rows():
+    repos = [Path("/w/a/api"), Path("/w/b/api"), Path("/w/docs")]
+    dash = Dashboard(repos, {}, ASCII_GLYPHS, labels={repos[0]: "a/api", repos[1]: "b/api"})
+    text = render_plain(dash, 80)
+    assert "a/api" in text and "b/api" in text and "docs" in text
+    assert [r.name for r in dash.rows.values()] == ["a/api", "b/api", "docs"]
+
+
+def test_without_labels_rows_show_the_directory_name():
+    repos = [Path("/w/a/api"), Path("/w/docs")]
+    dash = Dashboard(repos, {}, ASCII_GLYPHS)
+    assert [r.name for r in dash.rows.values()] == ["api", "docs"]

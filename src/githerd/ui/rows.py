@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from rich.cells import cell_len, set_cell_size
@@ -54,6 +55,20 @@ def _pad(text: str, width: int) -> str:
     return text + " " * max(0, width - cell_len(text))
 
 
+def _clip(line: Text, room: int, glyphs: Glyphs) -> None:
+    """Cut ``line`` in place to at most ``room`` cells, ending in the glyph set's ellipsis marker."""
+    if cell_len(line.plain) <= room:
+        return
+    marker = glyphs.ellipsis
+    marker_w = cell_len(marker)
+    if room <= marker_w:
+        line.truncate(0, overflow="crop")
+        line.append(set_cell_size(marker, max(room, 0)))
+    else:
+        line.truncate(room - marker_w, overflow="crop")
+        line.append(marker)
+
+
 def _glyph_and_style(state: RowState, glyphs: Glyphs) -> tuple[str, str]:
     if state.status == "queued":
         return glyphs.queued, "dim"
@@ -102,15 +117,7 @@ def render_row(
             room = suffix_room
         else:
             suffix = ""
-    marker = glyphs.ellipsis
-    if cell_len(line.plain) > room:
-        marker_w = cell_len(marker)
-        if room <= marker_w:
-            line.truncate(0, overflow="crop")
-            line.append(set_cell_size(marker, room))
-        else:
-            line.truncate(room - marker_w, overflow="crop")
-            line.append(marker)
+    _clip(line, room, glyphs)
     shortfall = room - cell_len(line.plain)
     if shortfall > 0:
         line.append(" " * shortfall)
@@ -126,10 +133,16 @@ def _sync_text(snap: RepoSnapshot, glyphs: Glyphs) -> str:
 
 
 def render_status(
-    snaps: list[RepoSnapshot], glyphs: Glyphs, *, max_name_width: int | None = 24
+    snaps: list[RepoSnapshot], glyphs: Glyphs, *, max_name_width: int | None = 24,
+    labels: dict[Path, str] | None = None, width: int | None = None,
 ) -> Text:
-    """One line per repo. ``max_name_width=None`` never truncates names (plain, piped output)."""
-    names = [safe_path(s.name) for s in snaps]
+    """One line per repo. ``max_name_width=None`` never truncates names (plain, piped output).
+
+    ``labels`` (repo path -> label) replaces the directory name, e.g. to tell apart repos that
+    share one. ``width`` (terminal cells) fits each ERROR line to one line, ending in the
+    glyph set's ellipsis; without it nothing is cut.
+    """
+    names = [safe_path((labels or {}).get(s.path, s.name)) for s in snaps]
     longest_name = max((cell_len(n) for n in names), default=0)
     name_w = longest_name if max_name_width is None else min(max_name_width, longest_name)
     branch_w = min(16, max((cell_len(s.branch or "(detached)") for s in snaps), default=0))
@@ -140,9 +153,13 @@ def render_status(
             out.append("\n")
         if snap.error:
             first = clean_message(snap.error.splitlines()[0]) if snap.error.strip() else snap.error
-            out.append(f"{glyphs.fail} ", style="error")
-            out.append(_pad(fit(name, name_w, glyphs), name_w), style="subject")
-            out.append(f"  error: {first}", style="error")
+            line = Text()
+            line.append(f"{glyphs.fail} ", style="error")
+            line.append(_pad(fit(name, name_w, glyphs), name_w), style="subject")
+            line.append(f"  error: {first}", style="error")
+            if width is not None:
+                _clip(line, width, glyphs)
+            out.append_text(line)
             continue
         glyph, style = (glyphs.attn, "warn") if snap.dirty else (glyphs.ok, "ok")
         branch = snap.branch or "(detached)"

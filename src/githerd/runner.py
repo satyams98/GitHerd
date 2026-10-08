@@ -172,9 +172,16 @@ async def _settle_after_kill(proc, stderr_task: asyncio.Future, wait_task: async
     abandoned: its task is cancelled and the pipes are closed, and the caller returns anyway.
     """
     discard_task = asyncio.ensure_future(_discard(proc.stdout))
-    done, pending = await asyncio.wait(
-        {discard_task, stderr_task, wait_task}, timeout=KILL_SETTLE_SECONDS
-    )
+    try:
+        done, pending = await asyncio.wait(
+            {discard_task, stderr_task, wait_task}, timeout=KILL_SETTLE_SECONDS
+        )
+    except BaseException:
+        # Cancelled (or interrupted) while waiting: the caller cancels its own tasks, but
+        # ``discard_task`` is ours, so it must not be left reading a pipe a descendant holds.
+        discard_task.cancel()
+        _abandon_pipes(proc)
+        raise
     for task in done:
         if not task.cancelled():
             task.exception()  # retrieved, so a failed drain is not reported as never-retrieved
