@@ -3,6 +3,8 @@ import shutil
 import stat
 from pathlib import Path
 
+import pytest
+
 from githerd.bulk import pull_repos
 from githerd.gitops import pull
 from githerd.journal import Journal, JournalEntry
@@ -217,7 +219,7 @@ async def test_undo_moved_repo_when_confirmed(make_repo, push_upstream, git, com
 
     _, items = await undo_last(root, journal, confirm_moved=confirm)
     assert [i.status for i in items] == ["restored"]
-    assert "newer commits dropped" in items[0].detail
+    assert items[0].detail == f"back to {outcome.before_head[:7]} (1 newer commit dropped)"
     assert git(repo, "rev-parse", "HEAD") == outcome.before_head
     assert asked == [(str(repo), later)]
 
@@ -226,9 +228,11 @@ async def test_undo_moved_repo_when_declined(make_repo, push_upstream, git, comm
     repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
     commit_local(repo, "later.txt")
     later = git(repo, "rev-parse", "HEAD")
+    before = journal.last_undoable()
     _, items = await undo_last(root, journal, confirm_moved=lambda entry, current: False)
     assert [i.status for i in items] == ["skipped"]
     assert git(repo, "rev-parse", "HEAD") == later
+    assert journal.last_undoable() == before  # still retryable
 
 
 async def test_confirmed_undo_of_moved_repo_can_be_redone(make_repo, push_upstream, git, commit_local, tmp_path):
@@ -369,3 +373,140 @@ async def test_reversal_of_confirmed_moved_undo_records_current_head(make_repo, 
         ("undo", later, outcome.before_head)
     ]
 
+
+# ---- moved repos: only the same history is offered; accurate detail ----
+
+DIFFERENT_HISTORY = "repo is on different history than this operation; not undone"
+
+
+class _PromptWasShown(BaseException):
+    """BaseException so undo_last cannot swallow it as a failing callback."""
+
+
+def _must_not_ask(entry, current):
+    raise _PromptWasShown(entry.repo)
+
+
+async def test_undo_moved_repo_two_newer_commits_detail(make_repo, push_upstream, git, commit_local, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "later1.txt")
+    commit_local(repo, "later2.txt")
+    _, items = await undo_last(root, journal, confirm_moved=lambda entry, current: True)
+    assert [i.status for i in items] == ["restored"]
+    assert items[0].detail == f"back to {outcome.before_head[:7]} (2 newer commits dropped)"
+
+
+async def test_undo_moved_repo_count_failure_falls_back_to_generic_detail(
+    monkeypatch, make_repo, push_upstream, git, commit_local, tmp_path
+):
+    import githerd.undo as undo_mod
+    from githerd.runner import GitResult
+
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "later.txt")
+    real = undo_mod.run_git
+
+    async def flaky(repo_path, *args, **kwargs):
+        if args[:1] == ("rev-list",):
+            return GitResult(code=128, stdout="", stderr="fatal: boom")
+        return await real(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(undo_mod, "run_git", flaky)
+    _, items = await undo_last(root, journal, confirm_moved=lambda entry, current: True)
+    assert [i.status for i in items] == ["restored"]
+    assert items[0].detail == f"back to {outcome.before_head[:7]} (newer commits dropped)"
+
+
+async def test_moved_repo_on_different_history_is_skipped_without_prompt(
+    make_repo, push_upstream, git, commit_local, tmp_path
+):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    # The pull was recorded on main; the user then moved to an unrelated line of work.
+    git(repo, "switch", "-c", "other", outcome.before_head)
+    commit_local(repo, "other.txt")
+    other_head = git(repo, "rev-parse", "HEAD")
+    before = journal.last_undoable()
+
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [i.status for i in items] == ["skipped"]
+    assert items[0].detail == DIFFERENT_HISTORY
+    assert git(repo, "rev-parse", "HEAD") == other_head
+    assert journal.last_undoable() == before  # entry stays retryable
+
+
+async def test_different_history_is_retryable_residual_next_to_restored_repo(
+    make_repo, push_upstream, git, commit_local, tmp_path
+):
+    a, b, root, journal, results = await _two_pulled(make_repo, push_upstream, tmp_path)
+    git(b, "switch", "-c", "other", results[b].before_head)
+    commit_local(b, "other.txt")
+
+    op_set, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    by = {Path(i.repo).name: i for i in items}
+    assert by["a"].status == "restored"
+    assert by["b"].status == "skipped"
+    assert by["b"].detail == DIFFERENT_HISTORY
+    residual = journal.last_undoable()
+    assert residual.description == f"{op_set.description} (not yet undone)"
+    assert [e.repo for e in residual.entries] == [str(b)]
+
+
+async def test_unresolvable_after_head_is_treated_as_different_history(make_repo, git, tmp_path):
+    repo = make_repo("a")
+    head = git(repo, "rev-parse", "HEAD")
+    journal = Journal(tmp_path)
+    journal.record("gone", [JournalEntry(
+        repo=str(repo), op="pull", before_head="2" * 40, after_head="1" * 40,
+    )])
+    before = journal.last_undoable()
+    _, items = await undo_last(tmp_path, journal, confirm_moved=_must_not_ask)
+    assert [i.status for i in items] == ["skipped"]
+    assert items[0].detail == DIFFERENT_HISTORY
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert journal.last_undoable() == before
+
+
+async def test_repo_already_at_before_head_is_skipped_not_retryable(make_repo, push_upstream, git, tmp_path):
+    a, b, root, journal, results = await _two_pulled(make_repo, push_upstream, tmp_path)
+    git(b, "reset", "--hard", results[b].before_head)  # user already reset elsewhere
+
+    op_set, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    by = {Path(i.repo).name: i for i in items}
+    assert by["a"].status == "restored"
+    assert by["b"].status == "skipped"
+    assert by["b"].detail == f"already at {results[b].before_head[:7]}"
+    assert git(b, "rev-parse", "HEAD") == results[b].before_head
+    last = journal.last_undoable()
+    assert last.description == f"undo: {op_set.description}"  # no residual for b
+    assert [e.repo for e in last.entries] == [str(a)]
+
+
+async def test_already_at_before_head_is_not_counted_as_restored(make_repo, push_upstream, git, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    git(repo, "reset", "--hard", outcome.before_head)
+    before = journal.last_undoable()
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [(i.status, i.detail) for i in items] == [("skipped", f"already at {outcome.before_head[:7]}")]
+    assert journal.last_undoable() == before  # nothing restored: journal untouched
+    assert _undo_opsets(journal) == []
+
+
+async def test_keyboard_interrupt_from_confirm_propagates(make_repo, push_upstream, git, commit_local, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "later.txt")
+    later = git(repo, "rev-parse", "HEAD")
+
+    def confirm(entry, current):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        await undo_last(root, journal, confirm_moved=confirm)
+    assert git(repo, "rev-parse", "HEAD") == later
+
+
+async def test_truthy_non_bool_confirm_is_accepted(make_repo, push_upstream, git, commit_local, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "later.txt")
+    _, items = await undo_last(root, journal, confirm_moved=lambda entry, current: "yes")
+    assert [i.status for i in items] == ["restored"]
+    assert git(repo, "rev-parse", "HEAD") == outcome.before_head
