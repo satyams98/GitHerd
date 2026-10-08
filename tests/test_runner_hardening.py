@@ -52,8 +52,10 @@ async def test_a_raising_progress_callback_is_logged_not_raised(caplog):
         text = await _drain_stderr(reader, explode)
     assert text == "one\ntwo\n"
     assert seen == ["one", "two"]  # the callback keeps being called after a failure
-    assert [r.name for r in caplog.records] == ["githerd.runner", "githerd.runner"]
+    # Only the first failure is logged at ERROR (with traceback); repeats are DEBUG-only.
+    assert [r.name for r in caplog.records] == ["githerd.runner"]
     assert "progress callback raised" in caplog.records[0].getMessage()
+    assert caplog.records[0].exc_info
 
 
 async def test_a_raising_progress_callback_does_not_break_git(make_repo, tmp_path):
@@ -145,13 +147,86 @@ async def test_kill_tree_tolerates_a_vanished_process(monkeypatch):
     await _kill_tree(Gone())  # must not raise
 
 
-async def test_cancelling_a_long_git_command_returns_promptly(tmp_path):
-    started = time.monotonic()
-    task = asyncio.create_task(
-        run_git(tmp_path, "-c", "alias.slow=!sleep 30", "slow")
+async def _tasklist(*flt: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        "tasklist", *flt, "/NH",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
-    await asyncio.sleep(0.5)
+    out, _ = await proc.communicate()
+    return out.decode("utf-8", errors="replace")
+
+
+async def _pid_alive(pid: int) -> bool:
+    return f" {pid} " in await _tasklist("/FI", f"PID eq {pid}")
+
+
+async def _sleep_count() -> int:
+    return (await _tasklist("/FI", "IMAGENAME eq sleep.exe")).lower().count("sleep.exe")
+
+
+async def test_cancelling_a_long_git_command_returns_promptly_and_leaves_no_process(tmp_path):
+    # `$$` is an MSYS pid, not a Windows one; /proc/$$/winpid maps it to the real pid.
+    marker = tmp_path / "pid.txt"
+    script = f"!cat /proc/$$/winpid > {marker.as_posix()} && sleep 30"
+    sleeps_before = await _sleep_count()
+    started = time.monotonic()
+    task = asyncio.create_task(run_git(tmp_path, "-c", f"alias.slow={script}", "slow"))
+    deadline = time.monotonic() + 10
+    while not (marker.exists() and marker.read_text().strip()):
+        assert time.monotonic() < deadline, "the alias never started"
+        await asyncio.sleep(0.05)
+    pid = int(marker.read_text().strip())
+    assert await _pid_alive(pid), "marker pid is not alive; the leak check would be vacuous"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert time.monotonic() - started < 15
+    deadline = time.monotonic() + 5
+    while await _pid_alive(pid) or await _sleep_count() > sleeps_before:
+        assert time.monotonic() < deadline, f"process {pid} or its sleep child survived the cancel"
+        await asyncio.sleep(0.1)
+
+
+async def test_guarded_logs_a_traceback_only_for_the_first_failure(caplog):
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"".join(b"line%d\n" % i for i in range(5)))
+    reader.feed_eof()
+
+    def explode(line: str) -> None:
+        raise RuntimeError("ui bug")
+
+    with caplog.at_level(logging.DEBUG, logger="githerd.runner"):
+        await _drain_stderr(reader, explode)
+    with_tb = [r for r in caplog.records if r.exc_info]
+    assert len(with_tb) == 1
+    assert with_tb[0].levelno == logging.ERROR
+    later = [r for r in caplog.records if r is not with_tb[0]]
+    assert len(later) == 4
+    assert all(r.levelno == logging.DEBUG and not r.exc_info for r in later)
+
+
+async def test_guarded_flag_is_per_closure(caplog):
+    def explode(line: str) -> None:
+        raise RuntimeError("ui bug")
+
+    first, second = runner._guarded(explode), runner._guarded(explode)
+    with caplog.at_level(logging.DEBUG, logger="githerd.runner"):
+        first("a")
+        second("b")
+    assert sum(1 for r in caplog.records if r.exc_info) == 2
+
+
+async def test_kill_tree_still_kills_when_the_taskkill_wait_is_cancelled(monkeypatch):
+    class FakeKiller:
+        async def wait(self):
+            raise asyncio.CancelledError
+
+    async def fake_exec(*args, **kwargs):
+        return FakeKiller()
+
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    proc = _FakeProc()
+    with pytest.raises(asyncio.CancelledError):
+        await _kill_tree(proc)
+    assert proc.killed

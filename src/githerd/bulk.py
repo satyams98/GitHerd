@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from pathlib import Path
 from typing import Awaitable, Callable, Literal
 
@@ -27,6 +28,15 @@ EventCb = Callable[[RepoEvent], None]
 Operation = Callable[[Path, ProgressCb], Awaitable[Outcome]]
 
 
+def _validate_timeout(timeout: float | None) -> float | None:
+    """Return the effective timeout: ``None`` for "no timeout" (``None`` or ``0``)."""
+    if timeout is None or timeout == 0:
+        return None
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("timeout must be a positive number of seconds")
+    return timeout
+
+
 async def run_bulk(
     repos: list[Path],
     op: Operation,
@@ -38,10 +48,12 @@ async def run_bulk(
     """Run ``op`` over ``repos`` with bounded concurrency.
 
     ``timeout`` is a per-repo limit in seconds; an operation exceeding it is cancelled
-    and reported as ``Failed``. ``None`` and ``0`` (any falsy value) mean no timeout.
+    and reported as ``Failed``. ``None`` and ``0`` mean no timeout; a negative or
+    non-finite value raises ``ValueError``.
     """
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
+    timeout = _validate_timeout(timeout)
     sem = asyncio.Semaphore(concurrency)
 
     def emit(event: RepoEvent) -> None:
@@ -64,15 +76,19 @@ async def run_bulk(
                     percent=parsed[1] if parsed else None,
                 ))
 
+            limiter = asyncio.timeout(timeout)  # timeout=None means no deadline
             try:
-                coro = op(repo, progress)
-                outcome = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+                async with limiter:
+                    outcome = await op(repo, progress)
             except asyncio.CancelledError:
                 raise
-            except asyncio.TimeoutError:
-                outcome = Failed(message=f"timed out after {timeout:g}s")
             except Exception as exc:  # one repo failing must not stop the others
-                outcome = Failed(message=str(exc) or type(exc).__name__)
+                # expired() is True only when *our* deadline fired, so an operation's
+                # own TimeoutError is an ordinary failure, not the bulk timeout.
+                if timeout is not None and limiter.expired():
+                    outcome = Failed(message=f"timed out after {timeout:g}s")
+                else:
+                    outcome = Failed(message=str(exc) or type(exc).__name__)
             emit(RepoEvent(repo=str(repo), kind="done", outcome=outcome))
             return repo, outcome
 
@@ -103,6 +119,7 @@ async def pull_repos(
     on_event: EventCb | None = None,
     timeout: float | None = None,
 ) -> dict[Path, Outcome]:
+    timeout = _validate_timeout(timeout)  # fail fast, before any work or journalling
     collected: dict[Path, Outcome] = {}
 
     def collect(event: RepoEvent) -> None:

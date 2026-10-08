@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -288,3 +289,63 @@ async def test_pull_repos_forwards_timeout_to_run_bulk(monkeypatch, tmp_path):
     monkeypatch.setattr(bulk, "run_bulk", fake_run_bulk)
     await pull_repos(tmp_path, [], timeout=12.5)
     assert seen["timeout"] == 12.5
+
+
+@pytest.mark.parametrize("timeout", [None, 0])
+async def test_run_bulk_inner_timeout_error_without_timeout_is_a_plain_failure(tmp_path, timeout):
+    bad, good = tmp_path / "bad", tmp_path / "good"
+
+    async def op(repo, progress):
+        if repo == bad:
+            raise TimeoutError("inner")
+        return UpToDate()
+
+    results = await run_bulk([bad, good], op, timeout=timeout)
+    assert results[bad] == Failed(message="inner")
+    assert results[good] == UpToDate()
+
+
+async def test_run_bulk_inner_timeout_error_message_never_empty(tmp_path):
+    async def op(repo, progress):
+        raise TimeoutError()
+
+    results = await run_bulk([tmp_path / "r"], op)
+    assert results[tmp_path / "r"] == Failed(message="TimeoutError")
+
+
+async def test_run_bulk_inner_timeout_error_with_real_timeout_does_not_crash(tmp_path):
+    bad, good = tmp_path / "bad", tmp_path / "good"
+
+    async def op(repo, progress):
+        if repo == bad:
+            raise TimeoutError("inner")
+        return UpToDate()
+
+    results = await run_bulk([bad, good], op, timeout=30)
+    assert results[good] == UpToDate()
+    assert isinstance(results[bad], Failed)
+    assert "inner" in results[bad].message  # not mislabelled as the bulk timeout
+
+
+@pytest.mark.parametrize("timeout", [-1, -0.5, float("nan"), float("inf"), float("-inf")])
+async def test_run_bulk_rejects_invalid_timeout(tmp_path, timeout):
+    started: list[Path] = []
+
+    async def op(repo, progress):
+        started.append(repo)
+        return UpToDate()
+
+    with pytest.raises(ValueError, match="timeout must be a positive number of seconds"):
+        await run_bulk([tmp_path / "r"], op, timeout=timeout)
+    assert started == []
+
+
+@pytest.mark.parametrize("timeout", [-1, float("nan"), float("inf")])
+async def test_pull_repos_rejects_invalid_timeout_before_any_work(monkeypatch, tmp_path, timeout):
+    async def fake_pull(repo, progress):
+        raise AssertionError("no work may start")
+
+    monkeypatch.setattr(bulk, "pull", fake_pull)
+    with pytest.raises(ValueError, match="timeout must be a positive number of seconds"):
+        await pull_repos(tmp_path / "work", [tmp_path / "r"], timeout=timeout)
+    assert not (tmp_path / "work").exists()  # nothing journalled either

@@ -52,11 +52,18 @@ def _guarded(on_progress: ProgressCb | None) -> ProgressCb | None:
     if on_progress is None:
         return None
 
+    failed_before = False
+
     def safe(line: str) -> None:
+        nonlocal failed_before
         try:
             on_progress(line)
-        except Exception:  # a UI bug must never abort a git operation
-            log.exception("progress callback raised")
+        except Exception as exc:  # a UI bug must never abort a git operation
+            if failed_before:  # a broken callback fires per line; don't flood the log
+                log.debug("progress callback raised again: %r", exc)
+            else:
+                failed_before = True
+                log.exception("progress callback raised")
 
     return safe
 
@@ -92,19 +99,22 @@ async def _kill_tree(proc) -> None:
     """Kill git and the helpers it spawned (fetch/merge children keep pipes open)."""
     if proc.returncode is not None:
         return
-    if sys.platform == "win32":
-        try:
-            killer = await asyncio.create_subprocess_exec(
-                "taskkill", "/F", "/T", "/PID", str(proc.pid),
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-            await killer.wait()
-        except Exception:
-            log.exception("taskkill failed for pid %s", proc.pid)
-    with contextlib.suppress(ProcessLookupError):
-        proc.kill()
-    with contextlib.suppress(Exception):
-        await asyncio.wait_for(proc.wait(), 5)
+    try:
+        if sys.platform == "win32":
+            try:
+                killer = await asyncio.create_subprocess_exec(
+                    "taskkill", "/F", "/T", "/PID", str(proc.pid),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await killer.wait()
+            except Exception:
+                log.exception("taskkill failed for pid %s", proc.pid)
+    finally:
+        # A second cancellation during taskkill must not skip the direct kill.
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), 5)
 
 
 async def run_git(
