@@ -276,3 +276,63 @@ async def test_vanished_untracked_file_reports_error(make_repo):
     result = await file_diff(repo, change)
     assert "no textual changes" not in result.text
     assert "gone.txt" in result.text
+
+
+# ---- H3 item 2: bounded git output ----------------------------------------------------
+
+async def test_a_huge_untracked_file_yields_a_bounded_diff_with_the_marker(make_repo):
+    import time
+
+    repo = make_repo("a")
+    line = "0123456789abcdef" * 4 + "\n"
+    (repo / "big.txt").write_text(line * (5_000_000 // len(line)), encoding="utf-8", newline="\n")
+    started = time.monotonic()
+    result = await file_diff(repo, await _change(repo, "big.txt"))
+    assert time.monotonic() - started < 10
+    assert result.text.endswith("... (truncated)")
+    assert result.text.count("(truncated)") == 1
+    assert len(result.text) <= diffs.MAX_DIFF_CHARS + len("\n... (truncated)")
+    assert "+0123456789abcdef" in result.text
+
+
+async def test_a_huge_modified_tracked_file_is_truncated_not_retried(make_repo, git):
+    repo = make_repo("a")
+    big = "line of text\n" * 300_000  # ~3.9 MB
+    (repo / "README.md").write_text(big, encoding="utf-8", newline="\n")
+    result = await file_diff(repo, await _change(repo, "README.md"))
+    assert result.text.endswith("... (truncated)")
+    assert "cannot show" not in result.text
+    assert "+line of text" in result.text
+
+
+async def test_a_large_binary_file_still_reports_git_binary_line(make_repo):
+    repo = make_repo("a")
+    (repo / "blob.bin").write_bytes((b"\x00\x01\xff" * 700_000))
+    result = await file_diff(repo, await _change(repo, "blob.bin"))
+    assert "Binary files" in result.text and "differ" in result.text
+    assert "truncated" not in result.text
+
+
+async def test_file_diff_passes_a_byte_cap_four_times_the_char_cap(make_repo, monkeypatch):
+    seen = []
+
+    async def spy(repo, *args, **kwargs):
+        seen.append(kwargs.get("max_stdout_bytes"))
+        return GitResult(code=0, stdout="+x\n", stderr="")
+
+    monkeypatch.setattr(diffs, "run_git", spy)
+    repo = make_repo("a")
+    for status in (" M", "??"):
+        await file_diff(repo, FileChange(status=status, path="README.md"))
+    assert seen == [diffs.MAX_DIFF_CHARS * 4] * 2
+
+
+async def test_a_truncated_result_is_marked_even_when_under_the_char_cap(make_repo, monkeypatch):
+    async def fake(repo, *args, **kwargs):
+        return GitResult(code=1, stdout="+partial\n", stderr="", truncated=True)
+
+    monkeypatch.setattr(diffs, "run_git", fake)
+    repo = make_repo("a")
+    for status in (" M", "??"):
+        result = await file_diff(repo, FileChange(status=status, path="README.md"))
+        assert result.text == "+partial\n\n... (truncated)"

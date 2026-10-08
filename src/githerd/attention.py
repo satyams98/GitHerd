@@ -7,26 +7,34 @@ from typing import Callable, Iterable
 from rich.console import Console
 from rich.text import Text
 
-from githerd.diffs import FileDiff, diffs_for
+from githerd.asyncutil import run_coro_sync
+from githerd.diffs import FileDiff, file_diff
 from githerd.bulk import HeadMove, record_pulls
 from githerd.gitops import head_and_branch, pull
 from githerd.interactive import run_git_interactive
-from githerd.outcomes import BlockedDirty, Outcome, describe
+from githerd.outcomes import BlockedDirty, FileChange, Outcome, describe
 from githerd.recover import stash_and_pull
 from githerd.textsafe import clean_message
 from githerd.ui import keys
 from githerd.ui.cards import actions_for, needs_attention, render_card
-from githerd.ui.diffview import run_diff_viewer
+from githerd.ui.diffview import run_lazy_diff_viewer
 from githerd.ui.theme import Glyphs
 
 STASH_NOTE = "  if you had local changes, check 'git stash list'"
 
-Viewer = Callable[[list[FileDiff]], object]
+# A viewer receives the dirty files and a SYNC loader for one file's diff; it should call the
+# loader only for the file it is showing (the diffs are loaded lazily, one git spawn each).
+Loader = Callable[[FileChange], FileDiff]
+Viewer = Callable[[list[FileChange], Loader], object]
 Heads = dict[Path, HeadMove]  # repo -> (first HEAD before, last HEAD after, branch it was on)
 
 
 def exit_code_for(outcomes: Iterable[Outcome]) -> int:
     return 2 if any(needs_attention(o) for o in outcomes) else 0
+
+
+def _default_viewer(changes: list[FileChange], loader: Loader) -> object:
+    return run_lazy_diff_viewer(changes, loader)  # looked up at call time so it can be patched
 
 
 def _head(repo: Path) -> tuple[str, str | None]:
@@ -71,7 +79,9 @@ def _resolve_one(
             break
         if action.id == "diff" and isinstance(outcome, BlockedDirty):
             try:
-                viewer(asyncio.run(diffs_for(repo, outcome.files)))
+                # The viewer calls the loader from inside prompt_toolkit's running event loop,
+                # where asyncio.run raises; run_coro_sync uses a fresh loop on a worker thread.
+                viewer(outcome.files, lambda change: run_coro_sync(file_diff(repo, change)))
             except Exception as exc:  # best-effort aid: e.g. prompt_toolkit raises its own error without a console
                 console.print(Text(
                     f"  diff viewer unavailable: {clean_message(str(exc)) or type(exc).__name__}", style="dim",
@@ -98,7 +108,7 @@ def resolve_attention(
     glyphs: Glyphs,
     *,
     read_key: Callable[[], str] | None = None,
-    viewer: Viewer = run_diff_viewer,
+    viewer: Viewer = _default_viewer,
 ) -> dict[Path, Outcome]:
     reader = read_key or keys.read_key  # looked up at call time so it can be patched
     final = dict(results)  # never mutate the caller's mapping

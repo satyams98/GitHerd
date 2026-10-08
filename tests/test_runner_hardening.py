@@ -230,3 +230,90 @@ async def test_kill_tree_still_kills_when_the_taskkill_wait_is_cancelled(monkeyp
     with pytest.raises(asyncio.CancelledError):
         await _kill_tree(proc)
     assert proc.killed
+
+
+# ---- H3 item 1: bounded stdout (max_stdout_bytes) -------------------------------------
+
+async def _git_count() -> int:
+    return (await _tasklist("/FI", "IMAGENAME eq git.exe")).lower().count("git.exe")
+
+
+def _big_text(path, size=5_000_000):
+    line = "0123456789abcdef" * 4 + "\n"  # 65 bytes
+    path.write_text(line * (size // len(line)), encoding="utf-8", newline="\n")
+
+
+async def test_max_stdout_bytes_truncates_kills_and_is_quick(make_repo):
+    repo = make_repo("a")
+    _big_text(repo / "big.txt")
+    git_before = await _git_count()
+    started = time.monotonic()
+    result = await run_git(
+        repo, "diff", "--no-index", "--", "/dev/null", "big.txt", max_stdout_bytes=64_000
+    )
+    elapsed = time.monotonic() - started
+    assert result.truncated is True
+    assert 0 < len(result.stdout.encode()) <= 64_000 + 4096
+    assert elapsed < 10
+    deadline = time.monotonic() + 5
+    while await _git_count() > git_before:
+        assert time.monotonic() < deadline, "a git process survived the truncation"
+        await asyncio.sleep(0.1)
+
+
+async def test_without_the_cap_nothing_is_truncated(make_repo):
+    repo = make_repo("a")
+    _big_text(repo / "big.txt", 300_000)
+    result = await run_git(repo, "diff", "--no-index", "--", "/dev/null", "big.txt")
+    assert result.truncated is False
+    assert len(result.stdout) > 300_000
+    assert result.code == 1  # --no-index: "the files differ"
+
+
+async def _blob(repo, content: bytes) -> str:
+    import subprocess
+
+    done = subprocess.run(
+        ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+        input=content, capture_output=True, check=True,
+    )
+    return done.stdout.decode().strip()
+
+
+async def test_output_exactly_at_the_cap_is_not_truncated(make_repo):
+    repo = make_repo("a")
+    sha = await _blob(repo, b"a" * 1000)
+    exact = await run_git(repo, "cat-file", "-p", sha, max_stdout_bytes=1000)
+    assert exact.truncated is False and exact.stdout == "a" * 1000 and exact.ok
+    over = await run_git(repo, "cat-file", "-p", sha, max_stdout_bytes=999)
+    assert over.truncated is True and len(over.stdout) <= 999
+
+
+async def test_truncation_never_leaves_half_a_multibyte_character(make_repo):
+    repo = make_repo("a")
+    sha = await _blob(repo, "é".encode() * 1000)  # 2 bytes per character
+    result = await run_git(repo, "cat-file", "-p", sha, max_stdout_bytes=1001)
+    assert result.truncated is True
+    assert "�" not in result.stdout and set(result.stdout) == {"é"}
+
+
+async def test_the_cap_does_not_disturb_stderr_or_small_output(make_repo):
+    repo = make_repo("a")
+    ok = await run_git(repo, "rev-parse", "--abbrev-ref", "HEAD", max_stdout_bytes=1000)
+    assert ok.ok and ok.stdout.strip() == "main" and ok.truncated is False
+    bad = await run_git(repo, "cat-file", "-p", "deadbeef", max_stdout_bytes=1000)
+    assert not bad.ok and bad.stderr and bad.truncated is False
+
+
+async def test_a_capped_read_holds_at_most_the_cap_plus_one_chunk():
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"x" * 100_000)
+    reader.feed_eof()
+    data, truncated = await runner._read_capped(reader, 1000)
+    assert truncated is True and data == b"x" * 1000
+
+
+def test_git_result_truncated_defaults_to_false():
+    from githerd.runner import GitResult
+
+    assert GitResult(code=0, stdout="", stderr="").truncated is False

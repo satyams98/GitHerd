@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Callable, Sequence
 
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.input import Input
@@ -11,6 +12,8 @@ from prompt_toolkit.output import Output
 from prompt_toolkit.styles import Style
 
 from githerd.diffs import FileDiff
+from githerd.outcomes import FileChange
+from githerd.textsafe import clean_message
 
 DIFF_STYLE = Style.from_dict({
     "diff.header": "bold",
@@ -54,21 +57,59 @@ def style_line(line: str) -> str:
     return ""
 
 
-class ViewerState:
-    """Pure scrolling/navigation state so behaviour is testable without a terminal."""
+Loader = Callable[[FileChange], FileDiff]
+LOADING_TEXT = "(loading...)"
 
-    def __init__(self, files: list[FileDiff], page: int = 20) -> None:
-        self.files = files
+
+class ViewerState:
+    """Pure scrolling/navigation state so behaviour is testable without a terminal.
+
+    Eager use: ``ViewerState(list_of_FileDiff)``. Lazy use: ``ViewerState(list_of_FileChange,
+    loader=fn)``; ``fn`` is called synchronously, once per file, only when that file becomes
+    the one shown (``load_current``, which navigation calls), and its result is cached. A
+    loader that raises becomes that file's text, so the viewer never crashes on a load.
+    """
+
+    def __init__(
+        self,
+        files: Sequence[FileDiff | FileChange],
+        page: int = 20,
+        *,
+        loader: Loader | None = None,
+    ) -> None:
+        self.files = files if isinstance(files, list) else list(files)
         self.page = page
         self.index = 0
         self.offset = 0
+        self._loader = loader
+        self._loaded: dict[int, FileDiff] = {}
+        if loader is None:  # eager: every entry already carries its text
+            self._loaded = {i: f for i, f in enumerate(self.files) if isinstance(f, FileDiff)}
+
+    def load_current(self) -> None:
+        """Load the file being shown if it is not loaded yet (no-op otherwise)."""
+        if not self.files or self.index in self._loaded or self._loader is None:
+            return
+        change = self.files[self.index]
+        try:
+            self._loaded[self.index] = self._loader(change)
+        except Exception as exc:  # a failed load must never take the viewer down
+            reason = clean_message(str(exc)) or type(exc).__name__
+            self._loaded[self.index] = FileDiff(
+                change.path, change.status, f"(could not load {change.path}: {reason})"
+            )
+
+    @property
+    def text(self) -> str:
+        loaded = self._loaded.get(self.index)
+        return loaded.text if loaded is not None else LOADING_TEXT
 
     @property
     def lines(self) -> list[str]:
         """Raw diff lines, split on LF only (so a bare CR or VT never splits a line)."""
         if not self.files:
             return []
-        parts = self.files[self.index].text.split("\n")
+        parts = self.text.split("\n")
         if parts and parts[-1] == "":
             parts.pop()
         return parts
@@ -92,11 +133,13 @@ class ViewerState:
         if self.index < len(self.files) - 1:
             self.index += 1
             self.offset = 0
+            self.load_current()
 
     def prev_file(self) -> None:
         if self.index > 0:
             self.index -= 1
             self.offset = 0
+            self.load_current()
 
     def formatted_body(self, height: int) -> list[tuple[str, str]]:
         window = [sanitize_line(line) for line in self.lines[self.offset : self.offset + height]]
@@ -114,9 +157,24 @@ class ViewerState:
 def run_diff_viewer(
     files: list[FileDiff], *, input: Input | None = None, output: Output | None = None
 ) -> ViewerState:
-    state = ViewerState(files)
-    if not files:
+    return _run_viewer(ViewerState(files), input, output)
+
+
+def run_lazy_diff_viewer(
+    changes: list[FileChange],
+    loader: Loader,
+    *,
+    input: Input | None = None,
+    output: Output | None = None,
+) -> ViewerState:
+    """Open the viewer on not-yet-loaded files; ``loader`` runs only for files shown."""
+    return _run_viewer(ViewerState(changes, loader=loader), input, output)
+
+
+def _run_viewer(state: ViewerState, input: Input | None, output: Output | None) -> ViewerState:
+    if not state.files:
         return state
+    state.load_current()
 
     kb = KeyBindings()
 

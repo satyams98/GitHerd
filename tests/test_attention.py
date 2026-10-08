@@ -52,9 +52,13 @@ def _blocked(make_repo, push_upstream):
 def test_diff_then_skip_opens_the_viewer_once(make_repo, push_upstream, tmp_path):
     repo, outcome = _blocked(make_repo, push_upstream)
     opened = []
+
+    def fake_viewer(changes, loader):  # opens by calling the loader for every change
+        opened.append([loader(c).path for c in changes])
+
     final = resolve_attention(
         make(), tmp_path, {repo: outcome}, ASCII_GLYPHS,
-        read_key=keys("d", "k"), viewer=lambda files: opened.append([f.path for f in files]),
+        read_key=keys("d", "k"), viewer=fake_viewer,
     )
     assert opened == [["README.md"]]
     assert final[repo] == outcome
@@ -130,7 +134,7 @@ def test_a_dead_diff_viewer_does_not_crash_the_loop(make_repo, push_upstream, tm
     repo, outcome = _blocked(make_repo, push_upstream)
     console = make()
 
-    def broken_viewer(files):
+    def broken_viewer(changes, loader):
         raise EOFError("no console")
 
     final = resolve_attention(
@@ -199,7 +203,7 @@ def test_any_diff_viewer_failure_is_a_dim_note_not_a_crash(make_repo, push_upstr
     repo, outcome = _blocked(make_repo, push_upstream)
     console = make()
 
-    def broken_viewer(files):
+    def broken_viewer(changes, loader):
         raise RuntimeError("NoConsoleScreenBufferError: no console")
 
     final = resolve_attention(
@@ -283,3 +287,89 @@ def test_a_detached_head_is_journaled_without_a_branch(make_repo, push_upstream,
     )
     (entry,) = Journal(root).last_undoable().entries
     assert entry.branch is None
+
+
+# ---- H3 item 4: the viewer loads diffs lazily ------------------------------------------
+
+def test_the_viewer_gets_changes_and_a_sync_loader_that_has_not_run_yet(
+    make_repo, push_upstream, monkeypatch, tmp_path
+):
+    repo, outcome = _blocked(make_repo, push_upstream)
+    spawned = []
+    real = attention.file_diff
+
+    async def spy(r, change):
+        spawned.append(change.path)
+        return await real(r, change)
+
+    monkeypatch.setattr(attention, "file_diff", spy)
+    seen = {}
+
+    def viewer(changes, loader):
+        seen["changes"] = [c.path for c in changes]
+        seen["before"] = list(spawned)
+        seen["diff"] = loader(changes[0])
+
+    resolve_attention(
+        make(), tmp_path, {repo: outcome}, ASCII_GLYPHS, read_key=keys("d", "k"), viewer=viewer,
+    )
+    assert seen["changes"] == ["README.md"]
+    assert seen["before"] == []  # opening the viewer spawned no git at all
+    assert spawned == ["README.md"]
+    assert "+local edit" in seen["diff"].text
+
+
+def test_the_loader_works_inside_a_running_event_loop(make_repo, push_upstream, tmp_path):
+    repo, outcome = _blocked(make_repo, push_upstream)
+    texts = []
+
+    def viewer(changes, loader):
+        async def inside_a_loop():  # like a prompt_toolkit key handler: asyncio.run would raise
+            texts.append(loader(changes[0]).text)
+
+        asyncio.run(inside_a_loop())
+
+    final = resolve_attention(
+        make(), tmp_path, {repo: outcome}, ASCII_GLYPHS, read_key=keys("d", "k"), viewer=viewer,
+    )
+    assert final[repo] == outcome
+    assert "+local edit" in texts[0]
+
+
+def test_the_default_viewer_is_the_lazy_one(make_repo, push_upstream, monkeypatch, tmp_path):
+    repo, outcome = _blocked(make_repo, push_upstream)
+    calls = []
+
+    def fake_lazy(changes, loader, **kwargs):
+        calls.append(([c.path for c in changes], loader(changes[0]).path))
+
+    monkeypatch.setattr(attention, "run_lazy_diff_viewer", fake_lazy)
+    resolve_attention(make(), tmp_path, {repo: outcome}, ASCII_GLYPHS, read_key=keys("d", "k"))
+    assert calls == [(["README.md"], "README.md")]
+
+
+def test_the_real_lazy_viewer_loads_through_the_sync_loader(make_repo, push_upstream, tmp_path):
+    import threading
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from githerd.ui.diffview import run_lazy_diff_viewer
+
+    repo, outcome = _blocked(make_repo, push_upstream)
+    states = []
+    with create_pipe_input() as inp:
+        inp.send_text("q")
+
+        def viewer(changes, loader):
+            states.append(run_lazy_diff_viewer(changes, loader, input=inp, output=DummyOutput()))
+
+        worker = threading.Thread(target=lambda: resolve_attention(
+            make(), tmp_path, {repo: outcome}, ASCII_GLYPHS,
+            read_key=keys("d", "k"), viewer=viewer,
+        ), daemon=True)
+        worker.start()
+        worker.join(30)
+        assert not worker.is_alive(), "the viewer did not exit"
+    (state,) = states
+    assert "+local edit" in state.text

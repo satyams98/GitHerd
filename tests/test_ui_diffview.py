@@ -5,7 +5,10 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from githerd.diffs import FileDiff
-from githerd.ui.diffview import ViewerState, run_diff_viewer, sanitize_line, style_line
+from githerd.outcomes import FileChange
+from githerd.ui.diffview import (
+    ViewerState, run_diff_viewer, run_lazy_diff_viewer, sanitize_line, style_line,
+)
 
 
 def run_with_timeout(fn, seconds=10):
@@ -203,3 +206,107 @@ def test_viewer_arrow_keys_and_paging():
     assert (state.index, state.offset) == (0, 0)
     state = run_keys(" q")
     assert state.offset == state.page
+
+
+# ---- H3 item 3: lazy loading ------------------------------------------------------------
+
+def changes(n=5):
+    return [FileChange(status=" M", path=f"f{i}.txt") for i in range(n)]
+
+
+def make_loader(calls, fail_on=()):
+    def loader(change):
+        calls.append(change.path)
+        if change.path in fail_on:
+            raise RuntimeError(f"boom \x1b[31m{change.path}\x1b[0m")
+        return FileDiff(change.path, change.status, f"+body of {change.path}")
+
+    return loader
+
+
+def run_lazy(keys, change_list, loader):
+    with create_pipe_input() as inp:
+        inp.send_text(keys)
+        return run_with_timeout(
+            lambda: run_lazy_diff_viewer(change_list, loader, input=inp, output=DummyOutput())
+        )
+
+
+def test_the_loader_runs_only_for_files_that_are_shown_and_only_once():
+    calls = []
+    state = run_lazy("nnq", changes(), make_loader(calls))
+    assert calls == ["f0.txt", "f1.txt", "f2.txt"]
+    assert state.index == 2
+
+
+def test_going_back_uses_the_cache():
+    calls = []
+    state = run_lazy("nnppq", changes(), make_loader(calls))
+    assert calls == ["f0.txt", "f1.txt", "f2.txt"]
+    assert state.index == 0
+    assert state.formatted_body(3) == [("class:diff.add", "+body of f0.txt\n")]
+
+
+def test_arrow_keys_load_lazily_too_and_edges_do_not_reload():
+    calls = []
+    run_lazy("\x1b[C\x1b[D\x1b[Dq", changes(3), make_loader(calls))  # right, left, left
+    assert calls == ["f0.txt", "f1.txt"]
+
+
+def test_a_raising_loader_shows_the_error_and_navigation_still_works():
+    calls = []
+    state = run_lazy("nq", changes(3), make_loader(calls, fail_on={"f1.txt"}))
+    assert calls == ["f0.txt", "f1.txt"]
+    (style, text), = state.formatted_body(3)
+    assert text.startswith("(could not load f1.txt: boom ")
+    assert "\x1b" not in text and "[31m" not in text  # message went through clean_message
+    state = run_lazy("nnppq", changes(3), make_loader([], fail_on={"f1.txt"}))
+    assert state.index == 0
+
+
+def test_a_failed_load_is_cached_and_not_retried():
+    calls = []
+    run_lazy("npnq", changes(3), make_loader(calls, fail_on={"f1.txt"}))
+    assert calls == ["f0.txt", "f1.txt"]
+
+
+def test_an_exception_without_a_message_is_named():
+    def loader(change):
+        raise ValueError()
+
+    state = run_lazy("q", changes(1), loader)
+    assert state.formatted_body(1) == [("", "(could not load f0.txt: ValueError)\n")]
+
+
+def test_a_lazy_empty_list_returns_immediately_without_loading():
+    calls = []
+    state = run_with_timeout(lambda: run_lazy_diff_viewer([], make_loader(calls)))
+    assert state.files == [] and calls == []
+
+
+def test_rendering_before_the_load_shows_a_placeholder():
+    calls = []
+    state = ViewerState(changes(2), loader=make_loader(calls))
+    assert calls == []
+    assert state.formatted_body(2) == [("", "(loading...)\n")]
+    assert "f0.txt" in state.header() and "1/2" in state.header()
+    state.load_current()
+    state.load_current()
+    assert calls == ["f0.txt"]
+    assert state.formatted_body(2) == [("class:diff.add", "+body of f0.txt\n")]
+
+
+def test_lazy_navigation_state_loads_on_next_and_prev_only_when_the_index_moves():
+    calls = []
+    state = ViewerState(changes(2), loader=make_loader(calls))
+    state.load_current()
+    state.prev_file()  # at the start: nothing moves, nothing loads
+    state.next_file()
+    state.next_file()  # at the end
+    assert calls == ["f0.txt", "f1.txt"]
+    assert state.header().startswith(" f1.txt")
+
+
+def test_eager_viewer_never_needs_a_loader():
+    state = run_keys("nq")
+    assert state.index == 1

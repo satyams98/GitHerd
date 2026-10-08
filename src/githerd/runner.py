@@ -27,6 +27,10 @@ class GitResult:
     code: int
     stdout: str
     stderr: str
+    # True when run_git(max_stdout_bytes=...) stopped reading and killed git: stdout is a
+    # PARTIAL prefix of the output and ``code`` is whatever the killed process reported, so
+    # callers must treat the result as incomplete rather than as a success or failure.
+    truncated: bool = False
 
     @property
     def ok(self) -> bool:
@@ -117,9 +121,43 @@ async def _kill_tree(proc) -> None:
             await asyncio.wait_for(proc.wait(), 5)
 
 
+_STDOUT_CHUNK = 16384
+
+
+async def _read_capped(stream: asyncio.StreamReader, cap: int) -> tuple[bytes, bool]:
+    """Read at most ``cap`` bytes; ``(data, True)`` as soon as more than ``cap`` have arrived.
+
+    Memory stays bounded: at most ``cap`` plus one chunk is ever held, and the excess is dropped.
+    """
+    buf = bytearray()
+    while True:
+        data = await stream.read(_STDOUT_CHUNK)
+        if not data:
+            return bytes(buf), False
+        buf += data
+        if len(buf) > cap:
+            del buf[cap:]
+            return bytes(buf), True
+
+
+async def _discard(stream: asyncio.StreamReader) -> None:
+    while await stream.read(_STDOUT_CHUNK):
+        pass
+
+
 async def run_git(
-    repo: Path | str, *args: str, on_progress: ProgressCb | None = None
+    repo: Path | str,
+    *args: str,
+    on_progress: ProgressCb | None = None,
+    max_stdout_bytes: int | None = None,
 ) -> GitResult:
+    """Run git and collect its output.
+
+    With ``max_stdout_bytes`` set, reading stops once more than that many stdout bytes have
+    arrived: the whole process tree is killed and the result has ``truncated=True``. Its
+    stdout is then a partial prefix and its exit code is whatever the killed process reports,
+    so callers must treat a truncated result as incomplete.
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
             "git", "-C", str(repo), *args,
@@ -131,12 +169,30 @@ async def run_git(
     except FileNotFoundError as exc:
         raise GitError("git executable not found; install Git for Windows") from exc
     assert proc.stdout is not None and proc.stderr is not None
+    truncated = False
+
+    async def read_stdout() -> bytes:
+        nonlocal truncated
+        if max_stdout_bytes is None:
+            return await proc.stdout.read()
+        data, truncated = await _read_capped(proc.stdout, max_stdout_bytes)
+        if truncated:  # stop git; the stderr drain and proc.wait() finish once it is gone
+            await _kill_tree(proc)
+            # proc.wait() only completes once the stdout pipe is closed too, so read (and
+            # discard) what is left until EOF; the dead process cannot add more.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(_discard(proc.stdout), 5)
+        return data
+
     try:
         stdout_b, stderr, _ = await asyncio.gather(
-            proc.stdout.read(), _drain_stderr(proc.stderr, on_progress), proc.wait()
+            read_stdout(), _drain_stderr(proc.stderr, on_progress), proc.wait()
         )
     except BaseException:
         await _kill_tree(proc)
         raise
     code = proc.returncode if proc.returncode is not None else -1
-    return GitResult(code=code, stdout=stdout_b.decode("utf-8", errors="replace"), stderr=stderr)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    # A cut in the middle of a character drops the fragment instead of showing U+FFFD.
+    stdout = decoder.decode(stdout_b, final=not truncated)
+    return GitResult(code=code, stdout=stdout, stderr=stderr, truncated=truncated)
