@@ -1,18 +1,21 @@
 import io
 from pathlib import Path
 
+import pytest
+from rich.cells import cell_len
+
 from githerd.bulk import RepoEvent
 from githerd.outcomes import BlockedDirty, FileChange, Ok, UpToDate
 from githerd.ui.dashboard import Dashboard, LiveDashboard
-from githerd.ui.theme import ASCII_GLYPHS, make_console
+from githerd.ui.theme import ASCII_GLYPHS, UNICODE_GLYPHS, make_console
 from tests.helpers_ui import render_plain
 
 
-def make_dashboard(clock=None):
+def make_dashboard(clock=None, glyphs=ASCII_GLYPHS, title="Pulling"):
     repos = [Path("/w/api"), Path("/w/billing"), Path("/w/docs")]
     branches = {"/w/api": "main", "/w/billing": "dev"}
     kwargs = {"clock": clock} if clock else {}
-    return Dashboard(repos, branches, ASCII_GLYPHS, title="Pulling", **kwargs), repos
+    return Dashboard(repos, branches, glyphs, title=title, **kwargs), repos
 
 
 def ev(repo, kind, **kw):
@@ -68,6 +71,7 @@ def test_live_dashboard_leaves_final_frame_in_scrollback():
         for name in ("api", "billing", "docs"):
             live.on_event(ev(name, "start"))
             live.on_event(ev(name, "done", outcome=UpToDate()))
+        assert live._live.transient is False
     text = console.export_text()
     assert "3/3" in text
     assert text.count("already up to date") >= 3
@@ -87,3 +91,162 @@ def test_live_dashboard_throttles_refreshes():
         now[0] = 0.061
         live.on_event(ev("api", "done", outcome=UpToDate()))  # done always refreshes
         assert calls[-1] == 0.061
+
+
+@pytest.mark.parametrize("glyphs", [UNICODE_GLYPHS, ASCII_GLYPHS], ids=["unicode", "ascii"])
+@pytest.mark.parametrize("width", [*range(0, 41), 80])
+def test_every_line_fits_the_width_and_header_is_one_line(width, glyphs):
+    dash, _ = make_dashboard(glyphs=glyphs)
+    text = render_plain(dash, width)
+    if width == 0:
+        assert text == ""  # rich emits nothing at zero width: no wrapped debris either
+        return
+    lines = text.split("\n")[:-1]
+    assert len(lines) == 1 + 3  # header + one line per repo: stable frame height
+    assert all(cell_len(line) <= width for line in lines)
+    if glyphs is ASCII_GLYPHS:
+        assert text.isascii()
+
+
+@pytest.mark.parametrize("width", [0, 1, 3, 10, 17, 18, 30, 80])
+def test_wide_character_title_keeps_header_on_one_line(width):
+    dash, _ = make_dashboard(title="拉取全部仓库")
+    text = render_plain(dash, width)
+    if width == 0:
+        assert text == ""
+        return
+    lines = text.split("\n")[:-1]
+    assert len(lines) == 4
+    assert all(cell_len(line) <= width for line in lines)
+    if width == 80:
+        assert "拉取全部仓库" in lines[0] and "0/3" in lines[0]
+        assert cell_len(lines[0]) == 80
+
+
+def test_header_is_padded_to_exact_width_when_it_fits():
+    dash, _ = make_dashboard()
+    header = render_plain(dash, 60).split("\n")[0]
+    assert cell_len(header) == 60 and header.startswith("Pulling 3 repos") and header.endswith("0/3")
+
+
+def test_narrow_header_shows_only_the_counter():
+    dash, _ = make_dashboard()
+    assert render_plain(dash, 5).split("\n")[0] == "0/3"
+
+
+def test_zero_repos_renders_without_error():
+    dash = Dashboard([], {}, ASCII_GLYPHS, title="Pulling")
+    text = render_plain(dash)
+    assert "0/0" in text and "0 repos" in text
+    assert len(text.split("\n")[:-1]) == 1
+
+
+def test_duplicate_and_late_events_do_not_regress_a_done_row():
+    ticks = iter([1.0, 3.0, 99.0, 99.0, 99.0])
+    dash, _ = make_dashboard(clock=lambda: next(ticks))
+    row = dash.rows[str(Path("/w/api"))]
+    dash.on_event(ev("api", "start"))
+    dash.on_event(ev("api", "done", outcome=UpToDate()))
+    assert (row.status, row.elapsed) == ("done", 2.0)
+    dash.on_event(ev("api", "start"))
+    dash.on_event(ev("api", "progress", text="Receiving objects:  10% (1/10)", percent=10))
+    dash.on_event(ev("api", "done", outcome=Ok(commits=1, files=1, before_head="a", after_head="b")))
+    assert row.status == "done" and row.elapsed == 2.0
+    assert isinstance(row.outcome, UpToDate)
+    assert row.percent is None and row.phase == ""
+
+
+def test_start_clears_stale_progress():
+    dash, _ = make_dashboard()
+    row = dash.rows[str(Path("/w/api"))]
+    dash.on_event(ev("api", "start"))
+    dash.on_event(ev("api", "progress", text="Receiving objects:  10% (1/10)", percent=10))
+    assert row.percent == 10 and row.phase
+    dash.on_event(ev("api", "start"))
+    assert row.percent is None and row.phase == "" and row.status == "running"
+
+
+def test_unknown_event_kind_is_ignored_not_treated_as_done():
+    dash, _ = make_dashboard()
+    dash.on_event(ev("api", "start"))
+    dash.on_event(RepoEvent.model_construct(repo=str(Path("/w/api")), kind="bogus", text="", percent=None, outcome=None))
+    row = dash.rows[str(Path("/w/api"))]
+    assert row.status == "running" and row.outcome is None
+
+
+def test_exception_inside_with_propagates_and_stops_live():
+    console = make_console(io.StringIO(), width=80, force_terminal=True)
+    dash, _ = make_dashboard()
+    captured = []
+    with pytest.raises(ValueError, match="boom"):
+        with LiveDashboard(console, dash) as live:
+            captured.append(live._live)
+            assert captured[0].is_started
+            raise ValueError("boom")
+    assert captured[0].is_started is False
+    with LiveDashboard(console, dash) as again:  # console is reusable afterwards
+        again.on_event(ev("api", "start"))
+
+
+class FailingFile(io.StringIO):
+    """File-like that raises OSError on write once `fail` is switched on."""
+
+    fail = False
+
+    def write(self, s):
+        if self.fail:
+            raise OSError("broken pipe")
+        return super().write(s)
+
+
+def test_teardown_write_failure_does_not_mask_the_original_exception():
+    file = FailingFile()
+    console = make_console(file, width=80, force_terminal=True)
+    dash, _ = make_dashboard()
+    captured = []
+    with pytest.raises(ValueError, match="boom"):
+        with LiveDashboard(console, dash) as live:
+            captured.append(live._live)
+            file.fail = True
+            raise ValueError("boom")
+    assert captured[0].is_started is False
+
+
+def test_teardown_write_failure_without_other_error_still_stops_live():
+    file = FailingFile()
+    console = make_console(file, width=80, force_terminal=True)
+    dash, _ = make_dashboard()
+    captured = []
+    with pytest.raises(OSError):
+        with LiveDashboard(console, dash) as live:
+            captured.append(live._live)
+            file.fail = True
+    assert captured[0].is_started is False
+
+
+def test_late_events_after_exit_update_state_but_do_not_refresh():
+    console = make_console(io.StringIO(), width=80, force_terminal=True)
+    dash, _ = make_dashboard()
+    with LiveDashboard(console, dash) as live:
+        inner = live._live
+        calls = []
+        inner.refresh = lambda: calls.append(1)
+    calls.clear()  # Live.stop() does its own final refresh
+    live.on_event(ev("api", "done", outcome=UpToDate()))
+    assert calls == []
+    assert dash.rows[str(Path("/w/api"))].status == "done"
+
+
+def test_live_dashboard_final_frame_survives_without_explicit_refresh():
+    console = make_console(io.StringIO(), width=80, force_terminal=True, record=True)
+    dash, _ = make_dashboard()
+    with LiveDashboard(console, dash, min_interval=3600.0, clock=lambda: 0.0) as live:
+        live.on_event(ev("api", "start"))
+        live.on_event(ev("api", "progress", text="Receiving objects:  10% (1/10)", percent=10))
+    text = console.export_text()  # clears the record buffer, so read it once
+    assert "Receiving objects" in text  # only the final frame has it: stop() redraws
+
+
+def test_header_is_empty_at_zero_width():
+    dash, _ = make_dashboard()
+    assert dash._header(0).plain == ""
