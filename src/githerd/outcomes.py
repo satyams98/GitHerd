@@ -5,6 +5,8 @@ from typing import Annotated, Iterable, Literal
 
 from pydantic import BaseModel, Field
 
+from githerd.textsafe import clean_message
+
 
 class FileChange(BaseModel):
     status: str  # two-character code, e.g. " M", "A ", "??", "UU"
@@ -94,8 +96,8 @@ def describe(outcome: "Outcome") -> str:
     if isinstance(outcome, AuthRequired):
         return "needs credentials"
     if isinstance(outcome, NetworkError):
-        return f"network error: {outcome.message}"
-    return f"failed: {outcome.message}"
+        return f"network error: {clean_message(outcome.message)}"
+    return f"failed: {clean_message(outcome.message)}"
 
 
 def summarize(outcomes: Iterable["Outcome"]) -> str:

@@ -15,12 +15,15 @@ from githerd.journal import Journal, JournalEntry
 from githerd.outcomes import BlockedDirty, Outcome, describe
 from githerd.recover import stash_and_pull
 from githerd.runner import run_git
+from githerd.textsafe import clean_message
 from githerd.ui import keys
 from githerd.ui.cards import actions_for, needs_attention, render_card
 from githerd.ui.diffview import run_diff_viewer
 from githerd.ui.theme import Glyphs
 
 log = logging.getLogger("githerd.attention")
+
+STASH_NOTE = "  your local changes are in 'git stash' (git stash list)"
 
 Viewer = Callable[[list[FileDiff]], object]
 Heads = dict[Path, tuple[str, str]]  # repo -> (first HEAD before, last HEAD after)
@@ -82,13 +85,17 @@ def _resolve_one(
         if action.id == "diff" and isinstance(outcome, BlockedDirty):
             try:
                 viewer(asyncio.run(diffs_for(repo, outcome.files)))
-            except (EOFError, OSError) as exc:
+            except Exception as exc:  # best-effort aid: e.g. prompt_toolkit raises its own error without a console
                 console.print(Text(
-                    f"  diff viewer unavailable: {str(exc) or type(exc).__name__}", style="dim",
+                    f"  diff viewer unavailable: {clean_message(str(exc)) or type(exc).__name__}", style="dim",
                 ))
             continue
         if action.id == "stash_pull":
-            outcome = _mutate(repo, heads, lambda: asyncio.run(stash_and_pull(repo)))
+            try:
+                outcome = _mutate(repo, heads, lambda: asyncio.run(stash_and_pull(repo)))
+            except BaseException:  # Ctrl+C: the work may be (or have been left) in the stash
+                console.print(Text(STASH_NOTE, style="dim"))
+                raise
         elif action.id == "auth":
             outcome = _mutate(repo, heads, authenticate)
         else:  # retry

@@ -9,6 +9,7 @@ from githerd.outcomes import (
     AuthRequired, BlockedDirty, Conflict, Diverged, Failed, FileChange,
     NetworkError, Ok, Outcome, UpToDate, describe,
 )
+from githerd.textsafe import safe_path
 from githerd.ui.theme import Glyphs
 
 
@@ -64,7 +65,7 @@ def _heading(name: str, outcome: Outcome, glyphs: Glyphs) -> Text:
     glyph, style = (glyphs.fail, "error") if isinstance(outcome, (NetworkError, Failed)) else (glyphs.attn, "warn")
     line = Text()
     line.append(f"{glyph} ", style=style)
-    line.append(name, style="subject")
+    line.append(safe_path(name), style="subject")
     line.append(f" {glyphs.sep} ", style="dim")
     line.append(describe(outcome), style=style)
     return line
@@ -73,7 +74,7 @@ def _heading(name: str, outcome: Outcome, glyphs: Glyphs) -> Text:
 def _file_line(change: FileChange, blocking: set[str]) -> Text:
     line = Text("    ")
     line.append(f"{change.status:<2} ", style=_status_style(change.status.strip() or change.status))
-    line.append(change.path)
+    line.append(safe_path(change.path))
     if change.path in blocking:
         line.append("  (blocks pull)", style="warn")
     return line
@@ -83,13 +84,22 @@ def render_card(name: str, outcome: Outcome, glyphs: Glyphs, *, max_files: int =
     lines: list[Text] = [_heading(name, outcome, glyphs)]
     if isinstance(outcome, BlockedDirty):
         blocking = set(outcome.blocking)
-        shown = outcome.files[:max_files]
+        ordered = outcome.files
+        if len(ordered) > max_files:  # never hide a blocker under "+N more"
+            ordered = (
+                [c for c in ordered if c.path in blocking]
+                + [c for c in ordered if c.path not in blocking]
+            )
+        shown = ordered[:max_files]
         lines.extend(_file_line(c, blocking) for c in shown)
         hidden = len(outcome.files) - len(shown)
         if hidden > 0:
             lines.append(Text(f"    +{hidden} more", style="dim"))
     elif isinstance(outcome, Conflict):
-        lines.extend(Text(f"    {path}", style="error") for path in outcome.files[:max_files])
+        lines.extend(Text(f"    {safe_path(path)}", style="error") for path in outcome.files[:max_files])
+        hidden = len(outcome.files) - max_files
+        if hidden > 0:
+            lines.append(Text(f"    +{hidden} more", style="dim"))
     elif isinstance(outcome, AuthRequired) and outcome.remote:
-        lines.append(Text(f"    remote: {outcome.remote}", style="dim"))
+        lines.append(Text(f"    remote: {safe_path(outcome.remote)}", style="dim"))
     return Group(*lines)

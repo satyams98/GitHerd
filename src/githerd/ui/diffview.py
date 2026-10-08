@@ -30,7 +30,7 @@ _CSI = re.compile(r"\x1b\[[0-?]*[ -/]*(?:[@-~]|$)")
 # Remaining ESC sequences: intermediates plus a final byte (e.g. ESC c, ESC ( B), or a lone ESC.
 _OTHER_ESC = re.compile(r"\x1b[ -/]*[0-~]?")
 # C0 (except TAB), DEL, C1, plus line/paragraph separators and bidi overrides/isolates.
-_CONTROL = re.compile("[\x00-\x08\x0a-\x1f\x7f-\x9f  ‪-‮⁦-⁩]")
+_CONTROL = re.compile("[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
 
 
 def sanitize_line(line: str) -> str:

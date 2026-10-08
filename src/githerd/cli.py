@@ -26,8 +26,9 @@ from rich.text import Text
 from githerd.attention import exit_code_for, resolve_attention
 from githerd.bulk import RepoEvent, pull_repos
 from githerd.journal import Journal
-from githerd.outcomes import describe, summarize
+from githerd.outcomes import Ok, Outcome, describe, summarize
 from githerd.repos import discover_repos, snapshot_all
+from githerd.textsafe import clean_message, safe_path
 from githerd.ui.confirm import confirm_destructive
 from githerd.ui.dashboard import Dashboard, LiveDashboard
 from githerd.ui.rows import render_status
@@ -88,6 +89,14 @@ def _interactive(console: Console) -> bool:
     return console.is_terminal and sys.stdin.isatty()
 
 
+UNDO_HINT = "undo available: githerd undo"
+
+
+def _moved_any(results: dict[str, Outcome] | dict[Path, Outcome]) -> bool:
+    """True when at least one repo was updated, i.e. its HEAD moved and the move was journaled."""
+    return any(isinstance(o, Ok) and o.before_head != o.after_head for o in results.values())
+
+
 def _finite_timeout(value: float) -> float:
     if not math.isfinite(value) or value < 1:
         raise typer.BadParameter("timeout must be a finite number of seconds >= 1")
@@ -119,7 +128,7 @@ def pull(
 ) -> None:
     """Pull every repo in parallel (fast-forward only).
 
-    
+    \b
     Exit codes:
       0    everything is up to date or was updated
       2    at least one repo still needs attention
@@ -139,17 +148,21 @@ def pull(
                 )
             console.print(Text(summarize(results.values()), style="subject"))
             results = resolve_attention(console, base, results, glyphs)
+            if _moved_any(results):
+                console.print(Text(UNDO_HINT, style="dim"))
         else:
             width = max(len(r.name) for r in repos)
 
             def on_event(event: RepoEvent) -> None:
                 if event.kind == "done" and event.outcome is not None:
-                    typer.echo(f"{Path(event.repo).name:<{width}}  {describe(event.outcome)}")
+                    typer.echo(f"{safe_path(Path(event.repo).name):<{width}}  {describe(event.outcome)}")
 
             results = asyncio.run(
                 pull_repos(base, repos, concurrency=jobs, timeout=timeout, on_event=on_event)
             )
             typer.echo(summarize(results.values()))
+            if _moved_any(results):
+                typer.echo(UNDO_HINT)
     code = exit_code_for(results.values())
     if code:
         raise typer.Exit(code=code)
@@ -159,7 +172,7 @@ def pull(
 def undo(root: RootOpt = None) -> None:
     """Undo the last operation (e.g. a bulk pull).
 
-    
+    \b
     Exit codes:
       0  every repo was restored, or there was nothing to undo
       2  at least one repo was skipped or failed to restore
@@ -188,7 +201,7 @@ def undo(root: RootOpt = None) -> None:
     if op_set is None:
         console.print("Nothing to undo.")
         return
-    console.print(Text(f"Undoing: {op_set.description}", style="subject"))
+    console.print(Text(f"Undoing: {clean_message(op_set.description)}", style="subject"))
     styles = {
         "restored": (glyphs.ok, "ok"),
         "skipped": (glyphs.attn, "warn"),
@@ -198,10 +211,10 @@ def undo(root: RootOpt = None) -> None:
         glyph, style = styles[item.status]
         line = Text()
         line.append(f"{glyph} ", style=style)
-        line.append(Path(item.repo).name, style="subject")
+        line.append(safe_path(Path(item.repo).name), style="subject")
         line.append(f"  {item.status}", style=style)
         if item.detail:
-            line.append(f": {item.detail}", style="dim")
+            line.append(f": {clean_message(item.detail)}", style="dim")
         console.print(line)
     if any(item.status != "restored" for item in items):
         raise typer.Exit(code=2)

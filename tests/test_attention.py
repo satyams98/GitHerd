@@ -188,3 +188,57 @@ def test_outcome_text_is_printed_literally_and_output_is_ascii(make_repo, tmp_pa
     out = console.file.getvalue()
     assert "[bold]boom[/bold]" in out
     assert out.isascii()
+
+
+# ---- review fixes: viewer failures and stranded stashes ----------------------------
+
+STASH_NOTE = "your local changes are in 'git stash' (git stash list)"
+
+
+def test_any_diff_viewer_failure_is_a_dim_note_not_a_crash(make_repo, push_upstream, tmp_path):
+    repo, outcome = _blocked(make_repo, push_upstream)
+    console = make()
+
+    def broken_viewer(files):
+        raise RuntimeError("NoConsoleScreenBufferError: no console")
+
+    final = resolve_attention(
+        console, tmp_path, {repo: outcome}, ASCII_GLYPHS,
+        read_key=keys("d", "k"), viewer=broken_viewer,
+    )
+    assert final[repo] == outcome
+    out = console.file.getvalue()
+    assert "diff viewer unavailable: NoConsoleScreenBufferError: no console" in out
+    assert out.isascii()
+
+
+def test_ctrl_c_during_stash_and_pull_prints_the_stash_note(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    console = make()
+
+    async def interrupted(repo, on_progress=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(attention, "stash_and_pull", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        resolve_attention(
+            console, tmp_path, {repo: BlockedDirty(files=[])}, ASCII_GLYPHS, read_key=keys("s"),
+        )
+    out = console.file.getvalue()
+    assert STASH_NOTE in out
+    assert out.isascii()
+
+
+def test_ctrl_c_during_a_plain_retry_prints_no_stash_note(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    console = make()
+
+    async def interrupted(repo, on_progress=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(attention, "pull", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        resolve_attention(
+            console, tmp_path, {repo: Failed(message="x")}, ASCII_GLYPHS, read_key=keys("r"),
+        )
+    assert STASH_NOTE not in console.file.getvalue()

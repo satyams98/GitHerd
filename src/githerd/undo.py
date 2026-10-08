@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from githerd.journal import Journal, JournalEntry, OpSet
 from githerd.runner import run_git
+from githerd.textsafe import clean_message
 
 # Ops whose reversal is "move HEAD back to before_head, keeping local changes".
 # Later plans register their own reversals (e.g. commit -> reset --soft) here.
@@ -131,8 +132,15 @@ async def undo_last(
                 ))
         else:
             items.append(UndoItem(repo=entry.repo, status="failed",
-                                  detail=res.stderr.strip().splitlines()[-1] if res.stderr.strip() else "git reset failed"))
+                                  detail=clean_message(res.stderr.strip().splitlines()[-1]) if res.stderr.strip() else "git reset failed"))
             retryable.append(entry)
+    if not restored_any and not retryable:
+        # Every entry was a permanent skip: nothing to retry, so close the op set
+        # instead of leaving it as the "last" one and hiding older op sets.
+        try:
+            journal.mark_undone(op_set.id)
+        except OSError:
+            log.exception("failed to close op set %s", op_set.id)
     if restored_any:
         try:
             journal.mark_undone(op_set.id)

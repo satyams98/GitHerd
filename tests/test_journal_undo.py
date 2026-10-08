@@ -487,8 +487,8 @@ async def test_already_at_before_head_is_not_counted_as_restored(make_repo, push
     before = journal.last_undoable()
     _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
     assert [(i.status, i.detail) for i in items] == [("skipped", f"already at {outcome.before_head[:7]}")]
-    assert journal.last_undoable() == before  # nothing restored: journal untouched
-    assert _undo_opsets(journal) == []
+    assert journal.last_undoable() is None  # only permanent skips: the op set is closed, not stuck
+    assert _undo_opsets(journal) == []  # and no undo of an undo is journaled
 
 
 async def test_keyboard_interrupt_from_confirm_propagates(make_repo, push_upstream, git, commit_local, tmp_path):
@@ -510,3 +510,48 @@ async def test_truthy_non_bool_confirm_is_accepted(make_repo, push_upstream, git
     _, items = await undo_last(root, journal, confirm_moved=lambda entry, current: "yes")
     assert [i.status for i in items] == ["restored"]
     assert git(repo, "rev-parse", "HEAD") == outcome.before_head
+
+
+# ---- op sets made only of permanent skips must not block older ones ----------------
+
+async def test_all_permanent_skips_close_the_op_set_so_older_ones_are_reachable(make_repo, git, tmp_path):
+    repo = make_repo("a")
+    head = git(repo, "rev-parse", "HEAD")
+    journal = Journal(tmp_path)
+    older = journal.record("older", [JournalEntry(repo=str(repo), op="pull", before_head="x", after_head=head)])
+    newer = journal.record("newer", [
+        JournalEntry(repo=str(tmp_path / "gone"), op="pull", before_head="a", after_head="b"),
+        JournalEntry(repo=str(repo), op="mystery", before_head="a", after_head=head),
+    ])
+    op_set, items = await undo_last(tmp_path, journal)
+    assert op_set == newer
+    assert [i.status for i in items] == ["skipped", "skipped"]  # items are reported as before
+    assert journal.last_undoable() == older
+    assert _undo_opsets(journal) == []
+
+
+async def test_a_retryable_entry_next_to_permanent_skips_keeps_the_op_set(make_repo, push_upstream, git, commit_local, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    commit_local(repo, "mine.txt")
+    gone = root / "gone"
+    journal.record("pull 2 repos", [
+        JournalEntry(repo=str(gone), op="pull", before_head="a", after_head="b"),
+        JournalEntry(repo=str(repo), op="pull", before_head=outcome.before_head, after_head=outcome.after_head),
+    ])
+    before = journal.last_undoable()
+    _, items = await undo_last(root, journal, confirm_moved=lambda entry, current: False)
+    assert {i.status for i in items} == {"skipped"}
+    assert journal.last_undoable() == before  # the declined moved repo is still retryable
+
+
+async def test_closing_a_permanent_skip_op_set_survives_a_journal_write_error(monkeypatch, make_repo, git, tmp_path):
+    repo = make_repo("a")
+    journal = Journal(tmp_path)
+    journal.record("weird", [JournalEntry(repo=str(repo), op="mystery", before_head="x", after_head="y")])
+
+    def boom(self, op_set_id):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Journal, "mark_undone", boom)
+    _, items = await undo_last(tmp_path, journal)
+    assert [i.status for i in items] == ["skipped"]

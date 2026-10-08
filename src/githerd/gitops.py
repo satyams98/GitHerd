@@ -8,6 +8,7 @@ from githerd.outcomes import (
 )
 from githerd.repos import snapshot
 from githerd.runner import GitError, ProgressCb, run_git
+from githerd.textsafe import clean_message
 
 _AUTH_MARKERS = (
     "authentication failed", "could not read username", "could not read password",
@@ -23,7 +24,7 @@ _NETWORK_MARKERS = (
 
 def _tail(text: str, lines: int = 3) -> str:
     kept = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    return " | ".join(kept[-lines:])
+    return clean_message(" | ".join(kept[-lines:]))
 
 
 _SIMPLE_ESCAPES = {
@@ -33,7 +34,7 @@ _SIMPLE_ESCAPES = {
 
 
 def _unquote_git_path(text: str) -> str:
-    """Undo git's C-style path quoting (``"na\\303\\257ve.txt"`` -> ``naïve.txt``).
+    """Undo git's C-style path quoting (the UTF-8 bytes ``\\303\\257`` inside quotes become one character).
 
     Text that is not wrapped in double quotes is returned unchanged.
     """
@@ -120,7 +121,7 @@ async def pull(repo: Path, on_progress: ProgressCb | None = None) -> Outcome:
     try:
         return await _pull(repo, on_progress)
     except GitError as exc:
-        return Failed(message=str(exc))
+        return Failed(message=clean_message(str(exc)))
 
 
 async def _pull(repo: Path, on_progress: ProgressCb | None) -> Outcome:
@@ -128,7 +129,7 @@ async def _pull(repo: Path, on_progress: ProgressCb | None) -> Outcome:
     if snap.branch is None:
         return Failed(message="detached HEAD: switch to a branch before pulling")
     if snap.upstream is None:
-        return Failed(message=f"branch '{snap.branch}' has no upstream configured")
+        return Failed(message=clean_message(f"branch '{snap.branch}' has no upstream configured"))
     before = snap.head
     res = await run_git(repo, "pull", "--ff-only", "--progress", on_progress=on_progress)
     if not res.ok:
@@ -156,7 +157,7 @@ async def fetch(repo: Path, on_progress: ProgressCb | None = None) -> Outcome:
     try:
         return await _fetch(repo, on_progress)
     except GitError as exc:
-        return Failed(message=str(exc))
+        return Failed(message=clean_message(str(exc)))
 
 
 async def _fetch(repo: Path, on_progress: ProgressCb | None) -> Outcome:

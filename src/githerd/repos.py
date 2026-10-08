@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from githerd.outcomes import FileChange
 from githerd.runner import GitError, run_git
+from githerd.textsafe import clean_message
 
 DEFAULT_IGNORE = frozenset(
     {"node_modules", ".venv", "venv", "__pycache__", ".tox", "dist", "build"}
@@ -100,7 +101,7 @@ async def snapshot(repo: Path) -> RepoSnapshot:
         repo, "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=normal"
     )
     if not res.ok:
-        raise GitError(res.stderr.strip() or "git status failed")
+        raise GitError(clean_message(res.stderr) or "git status failed")
     info = parse_status_v2(res.stdout)
     last = await run_git(repo, "log", "-1", "--format=%s")
     return RepoSnapshot(
@@ -118,7 +119,8 @@ async def snapshot_all(repos: list[Path], concurrency: int = 8) -> list[RepoSnap
                 return await snapshot(repo)
             except Exception as exc:  # one repo must never sink the whole listing
                 return RepoSnapshot(
-                    path=repo, name=repo.name, error=str(exc) or type(exc).__name__
+                    path=repo, name=repo.name,
+                    error=clean_message(str(exc)) or type(exc).__name__,
                 )
 
     return list(await asyncio.gather(*(one(r) for r in repos)))

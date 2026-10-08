@@ -11,6 +11,7 @@ from githerd.outcomes import (
     describe,
 )
 from githerd.repos import RepoSnapshot
+from githerd.textsafe import clean_message
 from githerd.ui.theme import Glyphs
 
 Status = Literal["queued", "running", "done"]
@@ -137,7 +138,7 @@ def render_status(
         if index:
             out.append("\n")
         if snap.error:
-            first = snap.error.splitlines()[0] if snap.error.strip() else snap.error
+            first = clean_message(snap.error.splitlines()[0]) if snap.error.strip() else snap.error
             out.append(f"{glyphs.fail} ", style="error")
             out.append(_pad(fit(snap.name, name_w, glyphs), name_w), style="subject")
             out.append(f"  error: {first}", style="error")

@@ -159,3 +159,83 @@ async def test_stash_failure_returns_failed_and_does_not_pull(make_repo, git, mo
     assert "stash" in outcome.message
     assert pulled == []
     assert (repo / "README.md").read_text(encoding="utf-8") == "dirty\n"
+
+
+# ---- Ctrl+C while a stash is pending -----------------------------------------------
+
+async def test_keyboard_interrupt_after_stash_restores_work_and_propagates(make_repo, git, monkeypatch):
+    repo = make_repo("a")
+    (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+    (repo / "scratch.txt").write_text("s\n", encoding="utf-8")
+
+    async def interrupted_pull(repo, on_progress=None):
+        assert git(repo, "stash", "list") != ""  # the stash exists when Ctrl+C lands
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(githerd.recover, "pull", interrupted_pull)
+    with pytest.raises(KeyboardInterrupt):
+        await stash_and_pull(repo)
+    assert_work_not_lost(repo, git, {"README.md": "dirty\n", "scratch.txt": "s\n"})
+    assert git(repo, "stash", "list") == ""  # popped back into the working tree
+    assert (repo / "README.md").read_text(encoding="utf-8") == "dirty\n"
+
+
+async def test_interrupt_pops_only_our_stash_not_an_older_one(make_repo, git, monkeypatch):
+    repo = make_repo("a")
+    (repo / "README.md").write_text("older\n", encoding="utf-8")
+    git(repo, "stash", "push", "-m", "user stash")
+    (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+
+    async def interrupted_pull(repo, on_progress=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(githerd.recover, "pull", interrupted_pull)
+    with pytest.raises(KeyboardInterrupt):
+        await stash_and_pull(repo)
+    assert (repo / "README.md").read_text(encoding="utf-8") == "dirty\n"
+    assert "user stash" in git(repo, "stash", "list")
+
+
+async def test_cancelled_async_pop_falls_back_to_a_synchronous_pop(make_repo, git, monkeypatch):
+    repo = make_repo("a")
+    (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+    real_run_git = githerd.recover.run_git
+
+    async def cancelling_pop(repo, *args, **kwargs):
+        if args[:2] == ("stash", "pop"):
+            raise asyncio.CancelledError
+        return await real_run_git(repo, *args, **kwargs)
+
+    async def interrupted_pull(repo, on_progress=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(githerd.recover, "run_git", cancelling_pop)
+    monkeypatch.setattr(githerd.recover, "pull", interrupted_pull)
+    with pytest.raises(KeyboardInterrupt):
+        await stash_and_pull(repo)
+    assert_work_not_lost(repo, git, {"README.md": "dirty\n"})
+    assert git(repo, "stash", "list") == ""
+
+
+async def test_failing_emergency_pop_still_propagates_and_keeps_the_stash(make_repo, git, monkeypatch):
+    repo = make_repo("a")
+    (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+    real_run_git = githerd.recover.run_git
+
+    async def broken_pop(repo, *args, **kwargs):
+        if args[:2] == ("stash", "pop"):
+            raise OSError("cannot spawn git")
+        return await real_run_git(repo, *args, **kwargs)
+
+    async def interrupted_pull(repo, on_progress=None):
+        raise KeyboardInterrupt
+
+    def broken_sync(*args, **kwargs):
+        raise OSError("cannot spawn git")
+
+    monkeypatch.setattr(githerd.recover, "run_git", broken_pop)
+    monkeypatch.setattr(githerd.recover, "pull", interrupted_pull)
+    monkeypatch.setattr(githerd.recover, "_sync_git", broken_sync)
+    with pytest.raises(KeyboardInterrupt):
+        await stash_and_pull(repo)
+    assert_work_not_lost(repo, git, {"README.md": "dirty\n"})  # still in `git stash list`

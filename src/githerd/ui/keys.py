@@ -71,7 +71,7 @@ def choose_action(
             if skip is not None:
                 return skip
             raise
-        if key == "" and skip is not None:
+        if key == "\x1b" and skip is not None:
             return skip
         for action in actions:
             if key.lower() == action.key.lower():

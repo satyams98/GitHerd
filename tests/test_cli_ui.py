@@ -67,7 +67,8 @@ def test_plain_pull_output_is_ascii_and_one_line_per_repo(make_repo, push_upstre
     assert result.exit_code == 0, result.output
     assert result.output.isascii()
     lines = [ln for ln in result.output.splitlines() if ln.strip()]
-    assert len(lines) == 3  # one per repo plus the summary
+    assert len(lines) == 4  # one per repo, the summary and the undo hint
+    assert lines[-1] == "undo available: githerd undo"
 
 
 def test_interactive_pull_draws_the_dashboard(make_repo, push_upstream, monkeypatch, tmp_path):
@@ -370,3 +371,49 @@ def test_real_sigint_during_plain_pull_exits_130(make_repo, monkeypatch, tmp_pat
     assert result.exit_code == 130, result.output
     assert "Interrupted." in result.output
     assert "Traceback" not in result.output
+
+
+# ---- undo hint after a pull that moved something -----------------------------------
+
+UNDO_HINT = "undo available: githerd undo"
+
+
+def test_plain_pull_prints_the_undo_hint_when_a_repo_was_updated(make_repo, push_upstream, tmp_path):
+    root = tmp_path / "work"
+    push_upstream(make_repo("a"), "n.txt")
+    make_repo("b")
+    result = runner.invoke(app, ["pull", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert UNDO_HINT in result.output
+    assert result.output.isascii()
+    assert result.output.strip().splitlines()[-1] == UNDO_HINT
+
+
+def test_plain_pull_prints_no_undo_hint_when_nothing_moved(make_repo, push_upstream, tmp_path):
+    root = tmp_path / "work"
+    make_repo("a")
+    b = make_repo("b")
+    (b / "README.md").write_text("local edit\n", encoding="utf-8")
+    push_upstream(b, "README.md", content="upstream edit\n")  # blocked, not updated
+    result = runner.invoke(app, ["pull", "--root", str(root)])
+    assert result.exit_code == 2
+    assert UNDO_HINT not in result.output
+
+
+def test_interactive_pull_prints_the_undo_hint_when_a_repo_was_updated(make_repo, push_upstream, monkeypatch, tmp_path):
+    console = _terminal(monkeypatch)
+    root = tmp_path / "work"
+    push_upstream(make_repo("a"), "n.txt")
+    make_repo("b")
+    result = runner.invoke(app, ["pull", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert UNDO_HINT in console.export_text()
+
+
+def test_interactive_pull_prints_no_undo_hint_when_nothing_moved(make_repo, monkeypatch, tmp_path):
+    console = _terminal(monkeypatch)
+    root = tmp_path / "work"
+    make_repo("a")
+    result = runner.invoke(app, ["pull", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert UNDO_HINT not in console.export_text()
