@@ -317,3 +317,43 @@ def test_git_result_truncated_defaults_to_false():
     from githerd.runner import GitResult
 
     assert GitResult(code=0, stdout="", stderr="").truncated is False
+
+
+# ---- H7 item G: the post-kill phase of a capped read is bounded -------------------------------
+
+async def _kill_marked(marker, image: str) -> None:
+    """Kill the process whose pid the test script wrote to ``marker`` (and only that one)."""
+    try:
+        pid = int(marker.read_text().strip())
+    except (OSError, ValueError):
+        return
+    if image in (await _tasklist("/FI", f"PID eq {pid}")).lower():
+        killer = await asyncio.create_subprocess_exec(
+            "taskkill", "/F", "/PID", str(pid),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await killer.wait()
+
+
+async def test_a_descendant_holding_the_pipes_cannot_hang_a_capped_read(tmp_path):
+    yes_marker, sleep_marker = tmp_path / "yes.pid", tmp_path / "sleep.pid"
+    script = (  # an orphaned `yes` floods stdout; `sleep` keeps stderr open; both outlive git
+        f"!(yes & cat /proc/$!/winpid > {yes_marker.as_posix()}); "
+        f"sleep 100 & cat /proc/$!/winpid > {sleep_marker.as_posix()}; wait"
+    )
+    started = time.monotonic()
+    try:
+        result = await asyncio.wait_for(
+            run_git(tmp_path, "-c", f"alias.spam={script}", "spam", max_stdout_bytes=64_000), 40
+        )
+        elapsed = time.monotonic() - started
+        assert result.truncated is True
+        assert elapsed < 15, f"the capped read took {elapsed:.1f}s to give up on the pipes"
+    finally:
+        await _kill_marked(yes_marker, "yes.exe")
+        await _kill_marked(sleep_marker, "sleep.exe")
+
+
+async def test_a_negative_stdout_cap_is_rejected_before_spawning(tmp_path):
+    with pytest.raises(ValueError, match="max_stdout_bytes"):
+        await run_git(tmp_path, "--version", max_stdout_bytes=-1)

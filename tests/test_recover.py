@@ -331,3 +331,30 @@ async def test_a_clean_pop_does_not_produce_a_stash_flag(make_repo, push_upstrea
     (repo / "scratch.txt").write_text("s\n", encoding="utf-8")
     push_upstream(repo, "other.txt")
     assert isinstance(await stash_and_pull(repo), Ok)
+
+
+# ---- H7 item A: is our auto-stash still around? ------------------------------------------------
+
+async def test_auto_stash_present_sees_only_our_own_stash(make_repo, git, tmp_path):
+    from githerd.recover import STASH_MESSAGE, auto_stash_present
+
+    repo = make_repo("a")
+    assert await auto_stash_present(repo) is False
+    (repo / "README.md").write_text("mine\n", encoding="utf-8")
+    git(repo, "stash", "push", "-m", "somebody else's stash")
+    assert await auto_stash_present(repo) is False
+    (repo / "README.md").write_text("ours\n", encoding="utf-8")
+    git(repo, "stash", "push", "-m", STASH_MESSAGE)
+    assert await auto_stash_present(repo) is True
+
+
+async def test_auto_stash_present_never_raises(monkeypatch, tmp_path):
+    from githerd.recover import auto_stash_present
+
+    assert await auto_stash_present(tmp_path / "missing") is False
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("git exploded")
+
+    monkeypatch.setattr(githerd.recover, "run_git", boom)
+    assert await auto_stash_present(tmp_path) is False

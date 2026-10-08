@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlsplit, urlunsplit
 
 from githerd.outcomes import (
@@ -125,40 +126,80 @@ _HEADS = "refs/heads/"
 HEAD_AND_BRANCH_ARGS = ("rev-parse", "HEAD", "--symbolic-full-name", "HEAD")
 
 
-def parse_head_and_branch(stdout: str) -> tuple[str, str | None] | None:
+class HeadState(NamedTuple):
+    """What ``rev-parse HEAD --symbolic-full-name HEAD`` said about a repo that git could read.
+
+    ``branch_known`` is False when the sha is fine but the ref is not a local branch or
+    detached marker (a symref to a remote ref, say): ``branch`` is then ``None`` too, so
+    that case must be told apart from a genuinely detached HEAD (``branch_known`` True).
+    """
+
+    sha: str
+    branch: str | None
+    branch_known: bool
+
+
+def parse_head_state(stdout: str) -> HeadState | None:
     """Parse ``git rev-parse HEAD --symbolic-full-name HEAD``: the sha, then the full ref.
 
     The full ref (``refs/heads/<name>``) is unambiguous even when a tag has the branch's
     name (``--abbrev-ref`` would print ``heads/<name>`` then). A detached HEAD prints
-    ``HEAD`` and yields branch ``None``. Anything else (a non-branch ref, missing lines)
-    is unparseable and gives ``None``: a branch name is never guessed.
+    ``HEAD`` and yields branch ``None`` with ``branch_known``. Anything else (a non-branch
+    ref, a missing line) keeps the sha but has ``branch_known`` False: a branch name is
+    never guessed. No sha at all gives ``None``.
+
+    Lines are split on ``"\\n"`` only (a trailing ``"\\r"`` is dropped): git allows U+2028,
+    U+2029 and U+0085 in branch names, and ``splitlines()`` / ``strip()`` would cut them.
     """
-    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-    if len(lines) != 2:
+    lines = stdout.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()  # the newline that ends the output
+    lines = [line[:-1] if line.endswith("\r") else line for line in lines]
+    if not lines or not lines[0]:
         return None
-    sha, ref = lines
+    sha = lines[0]
+    if len(lines) != 2:
+        return HeadState(sha, None, False)
+    ref = lines[1]
     if ref == "HEAD":
-        return sha, None
+        return HeadState(sha, None, True)
     if ref.startswith(_HEADS) and len(ref) > len(_HEADS):
-        return sha, ref[len(_HEADS):]
-    return None
+        return HeadState(sha, ref[len(_HEADS):], True)
+    return HeadState(sha, None, False)
+
+
+def parse_head_and_branch(stdout: str) -> tuple[str, str | None] | None:
+    """``(sha, branch or None if detached)`` from the same output, ``None`` when unparseable."""
+    state = parse_head_state(stdout)
+    if state is None or not state.branch_known:
+        return None
+    return state.sha, state.branch
+
+
+async def head_state(repo: Path) -> HeadState | None:
+    """The HEAD sha and branch in ONE git spawn; ``None`` only when git itself failed.
+
+    An unborn repo (no commits yet) or a path that is not a repo is a git failure. Unlike
+    ``head_and_branch`` this keeps a readable sha whose branch could not be parsed.
+    """
+    res = await run_git(repo, *HEAD_AND_BRANCH_ARGS)
+    return parse_head_state(res.stdout) if res.ok else None
 
 
 async def head_and_branch(repo: Path) -> tuple[str, str | None] | None:
     """``(head sha, branch or None if detached)`` in ONE git spawn; ``None`` when unreadable.
 
-    An unborn repo (no commits yet) or a path that is not a repo is unreadable.
+    An unborn repo (no commits yet), a path that is not a repo, or a HEAD whose branch
+    cannot be parsed is unreadable.
     """
-    res = await run_git(repo, *HEAD_AND_BRANCH_ARGS)
-    return parse_head_and_branch(res.stdout) if res.ok else None
+    state = await head_state(repo)
+    if state is None or not state.branch_known:
+        return None
+    return state.sha, state.branch
 
 
-def git_sync(repo: Path | str, *args: str, timeout: float = 10) -> str | None:
-    """Run ``git -C repo args`` synchronously: stripped stdout, or ``None`` on any failure.
-
-    Needs no event loop, so it is safe in a ``finally`` that runs during cancellation.
-    Never raises.
-    """
+def _git_sync_raw(repo: Path | str, *args: str, timeout: float = 10) -> str | None:
+    """Like ``git_sync`` but the stdout is returned exactly as git wrote it."""
     try:
         res = subprocess.run(
             ["git", "-C", str(repo), *args], capture_output=True, text=True,
@@ -168,7 +209,17 @@ def git_sync(repo: Path | str, *args: str, timeout: float = 10) -> str | None:
     except Exception as exc:  # timeout, git missing, OS error: never fatal to the caller
         log.warning("git %s failed in %s: %r", " ".join(args), repo, exc)
         return None
-    return res.stdout.strip() if res.returncode == 0 else None
+    return res.stdout if res.returncode == 0 else None
+
+
+def git_sync(repo: Path | str, *args: str, timeout: float = 10) -> str | None:
+    """Run ``git -C repo args`` synchronously: stripped stdout, or ``None`` on any failure.
+
+    Needs no event loop, so it is safe in a ``finally`` that runs during cancellation.
+    Never raises.
+    """
+    out = _git_sync_raw(repo, *args, timeout=timeout)
+    return out.strip() if out is not None else None
 
 
 def head_sync(repo: Path | str) -> str | None:
@@ -178,7 +229,7 @@ def head_sync(repo: Path | str) -> str | None:
 
 def head_and_branch_sync(repo: Path | str) -> tuple[str, str | None] | None:
     """Synchronous twin of ``head_and_branch`` (same single spawn, same parser)."""
-    out = git_sync(repo, *HEAD_AND_BRANCH_ARGS)
+    out = _git_sync_raw(repo, *HEAD_AND_BRANCH_ARGS)  # raw: strip() would eat a trailing U+0085
     return parse_head_and_branch(out) if out else None
 
 

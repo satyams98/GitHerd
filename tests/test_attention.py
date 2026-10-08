@@ -3,7 +3,7 @@ import io
 
 import pytest
 
-from githerd import attention
+from githerd import attention, recover
 from githerd.attention import exit_code_for, resolve_attention
 from githerd.gitops import pull
 from githerd.journal import Journal
@@ -421,13 +421,13 @@ def test_authenticate_prints_a_credentials_warning_before_handing_off(make_repo,
 
 
 def test_the_feedback_label_is_sanitised(tmp_path, monkeypatch):
-    repo = tmp_path / "evil‮\x1b[2Jname"  # never touches the file system
+    repo = tmp_path / "evil\u202e\x1b[2Jname"  # never touches the file system
     console = make()
     _fast(monkeypatch, "pull", UpToDate())
     resolve_attention(console, tmp_path, {repo: Failed(message="x")}, ASCII_GLYPHS, read_key=keys("r"))
     out = console.file.getvalue()
     assert "  pulling evil?name..." in out
-    assert "\x1b" not in out and "‮" not in out
+    assert "\x1b" not in out and "\u202e" not in out
 
 
 # ---- H4 item 2: actions honour the pull timeout ----------------------------------------------
@@ -616,3 +616,134 @@ def test_skip_all_still_journals_work_already_done(make_repo, push_upstream, tmp
     assert final[second] == results[second] and final[third] == results[third]
     (entry,) = Journal(root).last_undoable().entries
     assert entry.repo == str(first)
+
+
+# ---- H7 item A: a timeout must not leave the user's work in `git stash` unannounced -------------
+
+KEPT_SUFFIX = " (your local changes are still in 'git stash')"
+
+
+def test_a_timeout_that_strands_the_stash_says_so(make_repo, push_upstream, git, monkeypatch, tmp_path):
+    repo, outcome = _blocked(make_repo, push_upstream)
+    monkeypatch.setattr(recover, "pull", _hangs)  # stash push works, then the pull never finishes
+
+    async def restore_fails(repo, before):  # the best-effort pop after the cancel does not happen
+        return None
+
+    monkeypatch.setattr(recover, "_restore_after_interrupt", restore_fails)
+    console = make()
+    final = resolve_attention(
+        console, tmp_path, {repo: outcome}, ASCII_GLYPHS, read_key=keys("s", "k"), timeout=2,
+    )
+    assert final[repo] == Failed(message="timed out after 2s" + KEPT_SUFFIX)
+    out = console.file.getvalue()
+    assert STASH_NOTE in out
+    assert "failed: timed out after 2s" + KEPT_SUFFIX in out
+    assert recover.STASH_MESSAGE in git(repo, "stash", "list")  # the work really is in the stash
+
+
+def test_a_timeout_whose_restore_succeeds_prints_no_stash_note(make_repo, push_upstream, git, monkeypatch, tmp_path):
+    repo, outcome = _blocked(make_repo, push_upstream)
+    monkeypatch.setattr(recover, "pull", _hangs)
+    console = make()
+    final = resolve_attention(
+        console, tmp_path, {repo: outcome}, ASCII_GLYPHS, read_key=keys("s", "k"), timeout=2,
+    )
+    assert final[repo] == Failed(message="timed out after 2s")
+    assert STASH_NOTE not in console.file.getvalue()
+    assert git(repo, "stash", "list") == ""
+    assert (repo / "README.md").read_text(encoding="utf-8") == "local edit\n"
+
+
+def test_a_plain_retry_timeout_never_looks_at_the_stash(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+
+    async def no_look(repo):
+        raise AssertionError("a plain pull cannot have stashed anything")
+
+    monkeypatch.setattr(attention, "auto_stash_present", no_look)
+    monkeypatch.setattr(attention, "pull", _hangs)
+    final = resolve_attention(
+        make(), tmp_path, {repo: Failed(message="x")}, ASCII_GLYPHS, read_key=keys("r", "k"), timeout=0.2,
+    )
+    assert final[repo] == Failed(message="timed out after 0.2s")
+
+
+# ---- H7 item B: resolve_attention validates its timeout like bulk ---------------------------
+
+@pytest.mark.parametrize("timeout", [-1, -0.5, float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("needs_attention", [True, False])
+def test_an_invalid_timeout_is_rejected_up_front(make_repo, tmp_path, timeout, needs_attention):
+    repo = make_repo("a")
+
+    def no_keys():
+        raise AssertionError("must fail before any key is read")
+
+    outcome = Failed(message="x") if needs_attention else UpToDate()
+    with pytest.raises(ValueError, match="timeout must be a positive number of seconds"):
+        resolve_attention(
+            make(), tmp_path / "root", {repo: outcome}, ASCII_GLYPHS, read_key=no_keys, timeout=timeout,
+        )
+    assert not (tmp_path / "root").exists()  # nothing was journaled either
+
+
+def test_validate_timeout_is_public_and_none_or_zero_mean_no_timeout():
+    from githerd.bulk import validate_timeout
+
+    assert validate_timeout(None) is None
+    assert validate_timeout(0) is None
+    assert validate_timeout(2.5) == 2.5
+    with pytest.raises(ValueError):
+        validate_timeout(-1)
+
+
+# ---- H7 item H: the lazy viewer loads from inside prompt_toolkit's running loop -----------------
+
+def test_two_files_walked_with_n_then_q_load_each_once_inside_the_running_loop(
+    make_repo, push_upstream, monkeypatch, tmp_path
+):
+    import threading
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from githerd.ui.diffview import run_lazy_diff_viewer
+
+    repo = make_repo("a")
+    for name in ("x.txt", "y.txt"):  # untracked locally, added upstream: both block the pull
+        (repo / name).write_text(f"local {name}\n", encoding="utf-8")
+        push_upstream(repo, name, content=f"upstream {name}\n")
+    outcome = asyncio.run(pull(repo))
+    assert isinstance(outcome, BlockedDirty) and len(outcome.files) == 2
+
+    loaded = []
+    real = attention.file_diff
+
+    async def spy(r, change):
+        loaded.append(change.path)  # runs in the worker's loop, under the viewer's running loop
+        return await real(r, change)
+
+    monkeypatch.setattr(attention, "file_diff", spy)
+    states, errors = [], []
+    console = make()
+    with create_pipe_input() as inp:
+        inp.send_text("nq")
+
+        def viewer(changes, loader):
+            try:
+                states.append(run_lazy_diff_viewer(changes, loader, input=inp, output=DummyOutput()))
+            except Exception as exc:  # the attention loop would hide it as a dim note
+                errors.append(exc)
+                raise
+
+        worker = threading.Thread(target=lambda: resolve_attention(
+            console, tmp_path, {repo: outcome}, ASCII_GLYPHS, read_key=keys("d", "k"), viewer=viewer,
+        ), daemon=True)
+        worker.start()
+        worker.join(60)
+        assert not worker.is_alive(), "the viewer did not exit"
+    assert errors == []
+    assert "diff viewer unavailable" not in console.file.getvalue()
+    assert sorted(loaded) == ["x.txt", "y.txt"]  # each file exactly once
+    (state,) = states
+    assert "upstream" not in state.text and "local" in state.text

@@ -45,3 +45,26 @@ def test_help_exit_code_tables_keep_one_code_per_line():
                        ("130", "interrupted with Ctrl+C")):
         assert any(ln.split()[:1] == [code] and text in ln for ln in undo if ln.strip()), code
     assert all("\x08" not in ln for ln in pull + undo)
+
+
+# Bidi controls and Unicode line/paragraph separators must be written as \u escapes in tests,
+# never as raw characters (they are invisible and make a file read differently than it runs).
+# The set is built from code points so this file stays free of them itself.
+_RAW_BIDI = (
+    {chr(cp) for cp in range(0x202A, 0x202F)}
+    | {chr(cp) for cp in range(0x2066, 0x206A)}
+    | {chr(0x2028), chr(0x2029)}
+)
+TESTS = Path(__file__).resolve().parent
+
+
+def test_no_raw_bidi_controls_or_line_separators_in_tests():
+    files = sorted(TESTS.rglob("*.py"))
+    assert files, "no test files found"
+    offenders = []
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for number, line in enumerate(text.split("\n"), start=1):
+            for ch in sorted(_RAW_BIDI.intersection(line)):
+                offenders.append(f"{path.relative_to(TESTS)}:{number}: U+{ord(ch):04X}")
+    assert offenders == []

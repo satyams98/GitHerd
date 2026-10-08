@@ -11,6 +11,7 @@ from githerd.ui.theme import Glyphs
 KeyReader = Callable[[], str]
 
 MAX_CONSECUTIVE_EMPTY = 50
+MAX_FLUSH_READS = 10_000  # a console that never reports "empty" must not trap flush_input
 SPECIAL_KEY = "\x00"  # what read_key returns for an arrow/function key; "" means "nothing came"
 
 
@@ -47,7 +48,9 @@ def flush_input() -> None:
     try:
         import msvcrt
 
-        while msvcrt.kbhit():
+        for _ in range(MAX_FLUSH_READS):
+            if not msvcrt.kbhit():
+                break
             msvcrt.getwch()
     except OSError:  # no console to drain: nothing to flush
         pass
@@ -55,12 +58,13 @@ def flush_input() -> None:
 
 def choose_action(
     console: Console, actions: list[Action], glyphs: Glyphs,
-    read_key: KeyReader = read_key, flush: Callable[[], None] = flush_input,
+    read_key: KeyReader = read_key, flush: Callable[[], None] | None = None,
 ) -> Action:
     """Show the hint bar and block until the user presses a key bound to an action.
 
     Typed-ahead keys are discarded with ``flush`` (called once, after the hint bar is
-    printed and before the first read; an exception from it is ignored). Keys match
+    printed and before the first read; an exception from it is ignored). ``None`` means the
+    module's ``flush_input``, looked up when this runs so it can be patched. Keys match
     case-insensitively on both sides. Escape selects the ``skip`` action when one is
     offered. The ``SPECIAL_KEY`` sentinel (an arrow key) is ignored and counts as a real
     key. If the reader raises EOFError/OSError, or returns an empty string
@@ -82,7 +86,7 @@ def choose_action(
     skip = next((a for a in actions if a.id == "skip"), None)
     console.print(hint_bar(actions, glyphs))
     try:
-        flush()
+        (flush if flush is not None else flush_input)()
     except Exception:  # flushing is a courtesy; never let it block the choice
         pass
     empties = 0

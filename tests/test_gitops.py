@@ -340,6 +340,11 @@ def test_head_and_branch_sync_matches_the_async_reader(make_repo, git, tmp_path)
     ("a" * 40 + "\nrefs/heads/refs/heads/odd\n", ("a" * 40, "refs/heads/odd")),  # one prefix only
     ("a" * 40 + "\nHEAD\n", ("a" * 40, None)),
     ("a" * 40 + "\r\nrefs/heads/main\r\n", ("a" * 40, "main")),
+    ("a" * 40 + "\nrefs/heads/a\u2028b\n", ("a" * 40, "a\u2028b")),  # only "\n" separates lines
+    ("a" * 40 + "\nrefs/heads/a\u2029b\n", ("a" * 40, "a\u2029b")),
+    ("a" * 40 + "\nrefs/heads/caf\u0085\n", ("a" * 40, "caf\u0085")),  # trailing U+0085 is kept
+    ("a" * 40 + "\nrefs/heads/caf\u0085\r\n", ("a" * 40, "caf\u0085")),
+    ("a" * 40 + "\nrefs/heads/\u0085x\n", ("a" * 40, "\u0085x")),
     ("", None),
     ("a" * 40 + "\n", None),
     ("a" * 40 + "\nrefs/remotes/origin/x\n", None),  # not a local branch: unreadable, never guessed
@@ -372,3 +377,70 @@ async def test_pull_on_a_detached_head_is_not_retryable(make_repo, git):
 def test_an_ordinary_git_failure_stays_retryable():
     outcome = classify_failure("fatal: something odd happened")
     assert isinstance(outcome, Failed) and outcome.retryable is True
+
+
+# ---- H7 item D: branch names may contain line-separator characters ------------------------------
+
+ODD_NAMES = ["a\u2028b", "a\u2029b", "x\u0085y", "caf\u0085"]
+
+
+@pytest.mark.parametrize("name", ODD_NAMES)
+async def test_head_and_branch_round_trips_line_separator_branch_names(make_repo, git, name):
+    from githerd.gitops import head_and_branch, head_and_branch_sync
+
+    repo = make_repo("a")
+    git(repo, "switch", "-c", name)
+    expected = (git(repo, "rev-parse", "HEAD"), name)
+    assert await head_and_branch(repo) == expected
+    assert head_and_branch_sync(repo) == expected
+
+
+async def test_a_branch_named_like_a_real_one_plus_u0085_does_not_alias_it(make_repo, git):
+    from githerd.gitops import head_and_branch, head_and_branch_sync
+
+    repo = make_repo("a")
+    git(repo, "branch", "caf")
+    git(repo, "switch", "-c", "caf\u0085")
+    sha = git(repo, "rev-parse", "HEAD")
+    assert (await head_and_branch(repo))[1] == "caf\u0085" != "caf"
+    assert head_and_branch_sync(repo) == (sha, "caf\u0085")
+    git(repo, "switch", "caf")
+    assert head_and_branch_sync(repo) == (sha, "caf")
+
+
+# ---- H7 item E: telling "git failed" from "branch unparseable" ---------------------------------
+
+async def test_head_state_separates_a_git_failure_from_an_unparseable_branch(make_repo, git, tmp_path):
+    from githerd.gitops import head_state
+
+    repo = make_repo("a")
+    sha = git(repo, "rev-parse", "HEAD")
+    state = await head_state(repo)
+    assert (state.sha, state.branch, state.branch_known) == (sha, "main", True)
+    git(repo, "checkout", "--detach")
+    state = await head_state(repo)
+    assert (state.sha, state.branch, state.branch_known) == (sha, None, True)
+    git(repo, "symbolic-ref", "HEAD", "refs/remotes/origin/main")  # HEAD points at a remote ref
+    state = await head_state(repo)
+    assert (state.sha, state.branch, state.branch_known) == (git(repo, "rev-parse", "HEAD"), None, False)
+    assert await head_state(tmp_path / "missing") is None  # git itself failed
+
+
+async def test_head_and_branch_is_still_none_for_an_unparseable_branch(make_repo, git):
+    from githerd.gitops import head_and_branch
+
+    repo = make_repo("a")
+    git(repo, "symbolic-ref", "HEAD", "refs/remotes/origin/main")
+    assert await head_and_branch(repo) is None
+
+
+def test_parse_head_state():
+    from githerd.gitops import parse_head_state
+
+    sha = "a" * 40
+    assert parse_head_state(f"{sha}\nrefs/heads/main\n") == (sha, "main", True)
+    assert parse_head_state(f"{sha}\nHEAD\n") == (sha, None, True)
+    assert parse_head_state(f"{sha}\nrefs/remotes/o/x\n") == (sha, None, False)
+    assert parse_head_state(f"{sha}\n") == (sha, None, False)
+    assert parse_head_state("") is None
+    assert parse_head_state("\n") is None

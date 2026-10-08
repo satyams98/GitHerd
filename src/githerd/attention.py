@@ -9,11 +9,11 @@ from rich.text import Text
 
 from githerd.asyncutil import run_coro_sync
 from githerd.diffs import FileDiff, file_diff
-from githerd.bulk import HeadMove, record_pulls
+from githerd.bulk import HeadMove, record_pulls, validate_timeout
 from githerd.gitops import head_and_branch, pull
 from githerd.interactive import run_git_interactive
 from githerd.outcomes import BlockedDirty, Failed, FileChange, Outcome, describe
-from githerd.recover import stash_and_pull
+from githerd.recover import auto_stash_present, stash_and_pull
 from githerd.textsafe import clean_message, safe_path
 from githerd.ui import keys
 from githerd.ui.cards import actions_for, needs_attention, render_card
@@ -21,6 +21,7 @@ from githerd.ui.diffview import run_lazy_diff_viewer
 from githerd.ui.theme import Glyphs
 
 STASH_NOTE = "  if you had local changes, check 'git stash list'"
+STASH_KEPT_SUFFIX = " (your local changes are still in 'git stash')"
 
 # A viewer receives the dirty files and a SYNC loader for one file's diff; it should call the
 # loader only for the file it is showing (the diffs are loaded lazily, one git spawn each).
@@ -64,11 +65,16 @@ def _mutate(repo: Path, heads: Heads, action: Callable[[], Outcome]) -> Outcome:
         _record_move(heads, repo, before, _head(repo)[0], branch)
 
 
-async def _bounded(work: Awaitable[Outcome], timeout: float | None) -> Outcome:
+async def _bounded(
+    work: Awaitable[Outcome], timeout: float | None,
+    after_timeout: Callable[[], Awaitable[str]] | None = None,
+) -> Outcome:
     """Await ``work``; with a truthy ``timeout`` an overrun is cancelled and reported as ``Failed``.
 
     ``None`` and ``0`` mean no timeout, like the bulk pull. Cancellation kills the git
     process tree, and ``work`` gets to run its own clean-up (a stash is put back).
+    ``after_timeout`` runs only after our own deadline fired; the text it returns is
+    appended to the ``Failed`` message.
     """
     if not timeout:
         return await work
@@ -78,7 +84,10 @@ async def _bounded(work: Awaitable[Outcome], timeout: float | None) -> Outcome:
             return await work
     except TimeoutError:
         if limiter.expired():  # our deadline fired, not some TimeoutError inside the work
-            return Failed(message=f"timed out after {timeout:g}s")
+            message = f"timed out after {timeout:g}s"
+            if after_timeout is not None:
+                message += await after_timeout()
+            return Failed(message=message)
         raise
 
 
@@ -121,9 +130,19 @@ def _resolve_one(
             continue
         if action.id == "stash_pull":
             _note(console, f"  stashing, pulling, restoring {label}...")
+
+            async def stash_left() -> str:
+                # A timeout cancelled the work, and the restore after the cancel may not have
+                # happened: say so when our auto-stash is still there.
+                if not await auto_stash_present(repo):
+                    return ""
+                _note(console, STASH_NOTE)
+                return STASH_KEPT_SUFFIX
+
             try:
                 outcome = _mutate(
-                    repo, heads, lambda: asyncio.run(_bounded(stash_and_pull(repo), timeout)),
+                    repo, heads,
+                    lambda: asyncio.run(_bounded(stash_and_pull(repo), timeout, stash_left)),
                 )
             except BaseException:  # Ctrl+C: any stashed work may or may not have been put back
                 _note(console, STASH_NOTE)
@@ -150,13 +169,16 @@ def resolve_attention(
 ) -> dict[Path, Outcome]:
     """Walk the repos that need attention, offering one card each, and return the final outcomes.
 
-    ``timeout`` (seconds, ``None``/``0`` = none) limits each pull or stash-and-pull action
-    the user starts; the interactive authenticate hand-off is never timed. Choosing
+    ``timeout`` (seconds, ``None``/``0`` = none; negative or non-finite raises ``ValueError``
+    up front) limits each pull or stash-and-pull action the user starts; the interactive
+    authenticate hand-off is never timed. When a timeout leaves our auto-stash in
+    ``git stash``, the card says so. Choosing
     ``skip all`` leaves the current and every remaining repo as they are.
 
     This runs its own event loops (``asyncio.run``) and blocks on the keyboard, so it must
     not be called from a running event loop.
     """
+    timeout = validate_timeout(timeout)  # fail fast: before any card, key read or journal write
     reader = read_key or keys.read_key  # looked up at call time so it can be patched
     final = dict(results)  # never mutate the caller's mapping
     heads: Heads = {}

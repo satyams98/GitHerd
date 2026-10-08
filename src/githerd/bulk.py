@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Awaitable, Callable, Literal, Mapping
@@ -36,8 +37,11 @@ AFTER_READ_DEADLINE = 30.0
 _MAYBE_MOVED = (Failed, NetworkError, AuthRequired, Conflict)
 
 
-def _validate_timeout(timeout: float | None) -> float | None:
-    """Return the effective timeout: ``None`` for "no timeout" (``None`` or ``0``)."""
+def validate_timeout(timeout: float | None) -> float | None:
+    """Return the effective timeout: ``None`` for "no timeout" (``None`` or ``0``).
+
+    A negative or non-finite value raises ``ValueError``.
+    """
     if timeout is None or timeout == 0:
         return None
     if not math.isfinite(timeout) or timeout < 0:
@@ -61,7 +65,7 @@ async def run_bulk(
     """
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
-    timeout = _validate_timeout(timeout)
+    timeout = validate_timeout(timeout)
     sem = asyncio.Semaphore(concurrency)
 
     def emit(event: RepoEvent) -> None:
@@ -190,6 +194,22 @@ def _moved_without_outcome(
     return moves
 
 
+def _unique_repos(repos: list[Path]) -> list[Path]:
+    """Drop repeats (compared by resolved path), keeping the first spelling in first-seen order."""
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for repo in repos:
+        try:
+            resolved = Path(repo).resolve()
+        except (OSError, RuntimeError, ValueError):  # e.g. a symlink loop: fall back to the literal path
+            resolved = Path(os.path.abspath(repo))
+        key = os.path.normcase(str(resolved))
+        if key not in seen:
+            seen.add(key)
+            unique.append(repo)
+    return unique
+
+
 async def pull_repos(
     root: Path,
     repos: list[Path],
@@ -204,10 +224,14 @@ async def pull_repos(
     or was cancelled is still undoable. A failed pull that coincides with an unrelated HEAD
     move (the user committing concurrently) is journaled as a pull; undo only ever resets
     when HEAD is still at the recorded after_head.
+
+    A repo listed more than once (compared by resolved path) is pulled once, so two pulls can
+    never run in the same repo at the same time; the journal description counts unique repos.
     """
-    timeout = _validate_timeout(timeout)  # fail fast, before any work or journalling
+    timeout = validate_timeout(timeout)  # fail fast, before any work or journalling
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
+    repos = _unique_repos(repos)
     collected: dict[Path, Outcome] = {}
     baseline: dict[Path, tuple[str, str | None]] = {}  # repo -> (HEAD, branch) before pulling
 

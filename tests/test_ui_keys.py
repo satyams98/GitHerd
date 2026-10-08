@@ -241,3 +241,32 @@ def test_special_keys_reset_the_empty_counter():
 def test_the_sentinel_does_not_select_an_action_even_if_one_is_bound_to_it():
     odd = [Action("\x00", "weird", "weird"), SKIP]
     assert choose_action(console(), odd, ASCII_GLYPHS, keys("\x00", "k")).id == "skip"
+
+
+# ---- H7 item C: a bounded drain and a flush resolved at call time ----------------------------
+
+def test_flush_input_is_bounded_when_the_console_never_runs_dry(monkeypatch):
+    reads = []
+    fake = types.SimpleNamespace(kbhit=lambda: True, getwch=lambda: reads.append(1) or "x")
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    monkeypatch.setattr(sys, "platform", "win32")
+    flush_input()  # must return even though kbhit() is always true
+    assert len(reads) == 10_000
+
+
+def test_the_default_flush_is_looked_up_when_choose_action_runs(monkeypatch):
+    from githerd.ui import keys as keys_module
+
+    calls = []
+    monkeypatch.setattr(keys_module, "flush_input", lambda: calls.append("flushed"))
+    assert choose_action(console(), ACTIONS, ASCII_GLYPHS, keys("d")).id == "diff"
+    assert calls == ["flushed"]
+
+
+def test_an_explicit_flush_wins_over_the_module_default(monkeypatch):
+    from githerd.ui import keys as keys_module
+
+    monkeypatch.setattr(keys_module, "flush_input", lambda: (_ for _ in ()).throw(AssertionError("default used")))
+    calls = []
+    choose_action(console(), ACTIONS, ASCII_GLYPHS, keys("d"), lambda: calls.append("mine"))
+    assert calls == ["mine"]

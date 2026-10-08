@@ -99,8 +99,12 @@ async def _drain_stderr(stream: asyncio.StreamReader, on_progress: ProgressCb | 
     return "".join(chunks)
 
 
-async def _kill_tree(proc) -> None:
-    """Kill git and the helpers it spawned (fetch/merge children keep pipes open)."""
+async def _kill_tree(proc, *, wait: bool = True) -> None:
+    """Kill git and the helpers it spawned (fetch/merge children keep pipes open).
+
+    ``wait=False`` skips the final bounded wait for the process, for callers that bound
+    the whole post-kill phase themselves.
+    """
     if proc.returncode is not None:
         return
     try:
@@ -117,8 +121,9 @@ async def _kill_tree(proc) -> None:
         # A second cancellation during taskkill must not skip the direct kill.
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(proc.wait(), 5)
+        if wait:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), 5)
 
 
 _STDOUT_CHUNK = 16384
@@ -145,6 +150,49 @@ async def _discard(stream: asyncio.StreamReader) -> None:
         pass
 
 
+# Overall budget (seconds) for the phase after a capped read killed git: process exit, the end
+# of stdout and the end of the stderr drain. A descendant that inherited the pipes and
+# outlived git (a backgrounded helper) would otherwise hold them open for ever.
+KILL_SETTLE_SECONDS = 5.0
+
+
+def _abandon_pipes(proc) -> None:
+    """Close the transport so pipes a stray descendant still holds cannot keep us waiting."""
+    transport = getattr(proc, "_transport", None)
+    if transport is not None:
+        with contextlib.suppress(Exception):
+            transport.close()
+
+
+async def _settle_after_kill(proc, stderr_task: asyncio.Future, wait_task: asyncio.Future) -> str:
+    """Wait (bounded) for a killed git to exit and its pipes to end; returns what stderr gave.
+
+    ``proc.wait()`` only completes once the stdout pipe is closed too, so stdout is read (and
+    discarded) until EOF meanwhile. Whatever is not finished within ``KILL_SETTLE_SECONDS`` is
+    abandoned: its task is cancelled and the pipes are closed, and the caller returns anyway.
+    """
+    discard_task = asyncio.ensure_future(_discard(proc.stdout))
+    done, pending = await asyncio.wait(
+        {discard_task, stderr_task, wait_task}, timeout=KILL_SETTLE_SECONDS
+    )
+    for task in done:
+        if not task.cancelled():
+            task.exception()  # retrieved, so a failed drain is not reported as never-retrieved
+    stderr = ""
+    if stderr_task in done and not stderr_task.cancelled() and stderr_task.exception() is None:
+        stderr = stderr_task.result()
+    if pending:
+        log.warning(
+            "git (pid %s) was killed but its pipes stayed open for %gs; abandoning them",
+            getattr(proc, "pid", "?"), KILL_SETTLE_SECONDS,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        _abandon_pipes(proc)
+    return stderr
+
+
 async def run_git(
     repo: Path | str,
     *args: str,
@@ -156,8 +204,12 @@ async def run_git(
     With ``max_stdout_bytes`` set, reading stops once more than that many stdout bytes have
     arrived: the whole process tree is killed and the result has ``truncated=True``. Its
     stdout is then a partial prefix and its exit code is whatever the killed process reports,
-    so callers must treat a truncated result as incomplete.
+    so callers must treat a truncated result as incomplete. After the kill, waiting for git
+    and the pipes is bounded by ``KILL_SETTLE_SECONDS``: a descendant that keeps a pipe open
+    cannot hang the call. A negative cap raises ``ValueError``.
     """
+    if max_stdout_bytes is not None and max_stdout_bytes < 0:
+        raise ValueError("max_stdout_bytes must be >= 0")
     try:
         proc = await asyncio.create_subprocess_exec(
             "git", "-C", str(repo), *args,
@@ -176,19 +228,24 @@ async def run_git(
         if max_stdout_bytes is None:
             return await proc.stdout.read()
         data, truncated = await _read_capped(proc.stdout, max_stdout_bytes)
-        if truncated:  # stop git; the stderr drain and proc.wait() finish once it is gone
-            await _kill_tree(proc)
-            # proc.wait() only completes once the stdout pipe is closed too, so read (and
-            # discard) what is left until EOF; the dead process cannot add more.
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(_discard(proc.stdout), 5)
         return data
 
+    stdout_task = asyncio.ensure_future(read_stdout())
+    stderr_task = asyncio.ensure_future(_drain_stderr(proc.stderr, on_progress))
+    wait_task = asyncio.ensure_future(proc.wait())
     try:
-        stdout_b, stderr, _ = await asyncio.gather(
-            read_stdout(), _drain_stderr(proc.stderr, on_progress), proc.wait()
-        )
+        if max_stdout_bytes is None:
+            stdout_b, stderr, _ = await asyncio.gather(stdout_task, stderr_task, wait_task)
+        else:
+            stdout_b = await stdout_task
+            if truncated:  # stop git, then give its exit and pipes a bounded time to settle
+                await _kill_tree(proc, wait=False)
+                stderr = await _settle_after_kill(proc, stderr_task, wait_task)
+            else:
+                stderr, _ = await asyncio.gather(stderr_task, wait_task)
     except BaseException:
+        for task in (stdout_task, stderr_task, wait_task):
+            task.cancel()
         await _kill_tree(proc)
         raise
     code = proc.returncode if proc.returncode is not None else -1

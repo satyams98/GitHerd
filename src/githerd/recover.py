@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import subprocess
 from pathlib import Path
@@ -31,6 +32,19 @@ async def _conflicted_files(repo: Path) -> list[str]:
 async def _stash_tip(repo: Path) -> str:
     res = await run_git(repo, "rev-parse", "--verify", "--quiet", "refs/stash")
     return res.stdout.strip() if res.ok else ""
+
+
+async def auto_stash_present(repo: Path) -> bool:
+    """True when our auto-stash is still listed in ``git stash``; never raises.
+
+    Used after a timeout cancelled a stash-and-pull, where the restore may not have happened.
+    A git failure (or a hung git: bounded to 10 s) counts as "not present".
+    """
+    try:
+        res = await asyncio.wait_for(run_git(repo, "stash", "list"), 10)
+    except Exception:  # includes TimeoutError and GitError; cancellation still propagates
+        return False
+    return res.ok and STASH_MESSAGE in res.stdout
 
 
 async def _pop(repo: Path, on_success: Outcome) -> Outcome:

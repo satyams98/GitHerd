@@ -6,7 +6,7 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel
 
-from githerd.gitops import head_and_branch
+from githerd.gitops import head_state
 from githerd.journal import Journal, JournalEntry, OpSet
 from githerd.runner import run_git
 from githerd.textsafe import clean_message
@@ -69,7 +69,9 @@ async def undo_last(
     check: otherwise the repo is skipped without any prompt, stays retryable, and nothing
     is reset, even if its HEAD still equals ``after_head`` (a new branch cut at the pulled
     commit) or ``before_head`` (a hotfix branch cut at the old commit). Entries from old
-    journals have no branch and skip this check.
+    journals have no branch and skip this check. A repo whose HEAD sha is readable but whose
+    branch cannot be parsed (a symref to a remote ref, say) is skipped as retryable too;
+    only a failed ``rev-parse`` (repo missing, not a repo, unborn) is a permanent skip.
 
     A repo whose HEAD no longer equals the recorded ``after_head`` has "moved". If it
     simply moved forward on the same history (``after_head`` is an ancestor of HEAD),
@@ -99,12 +101,20 @@ async def undo_last(
             items.append(UndoItem(repo=entry.repo, status="skipped",
                                   detail=f"no undo available for '{entry.op}'"))
             continue
-        head = await head_and_branch(repo)  # one spawn: sha and unambiguous branch name
-        if head is None:
+        head = await head_state(repo)  # one spawn: sha and unambiguous branch name
+        if head is None:  # git itself failed: repo missing, not a repo, or unborn
             items.append(UndoItem(repo=entry.repo, status="skipped",
                                   detail="repo not found or not a git repository"))
             continue
-        current, now_on = head
+        if not head.branch_known:
+            # The sha is readable but HEAD is on something odd (a symref to a remote ref, a
+            # stray refs/heads/HEAD): resetting could move the wrong ref, but the repo is
+            # fine and the user can fix it, so keep the entry for a later attempt.
+            items.append(UndoItem(repo=entry.repo, status="skipped",
+                                  detail=clean_message("cannot tell which branch the repo is on; not undone")))
+            retryable.append(entry)
+            continue
+        current, now_on = head.sha, head.branch
         if entry.branch is not None and now_on != entry.branch:
             # The branch gate comes first: a branch cut at the pulled (or the previous)
             # commit is not what was pulled, and resetting it would move the wrong

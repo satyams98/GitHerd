@@ -753,3 +753,39 @@ async def test_different_history_on_the_same_branch_is_still_skipped_without_pro
     _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
     assert [(i.status, i.detail) for i in items] == [("skipped", DIFFERENT_HISTORY)]
     assert journal.last_undoable() == before
+
+
+# ---- H7 item E: an unparseable branch is retryable, not "repo not found" ------------------------
+
+ODD_BRANCH_DETAIL = "cannot tell which branch the repo is on; not undone"
+
+
+async def test_a_readable_sha_with_an_unparseable_branch_is_retryable(make_repo, push_upstream, git, tmp_path):
+    repo, root, journal, outcome = await _pulled_on_branch(make_repo, push_upstream, git, tmp_path)
+    git(repo, "symbolic-ref", "HEAD", "refs/remotes/origin/main")  # not a local branch
+    before = journal.last_undoable()
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [(i.status, i.detail) for i in items] == [("skipped", ODD_BRANCH_DETAIL)]
+    assert journal.last_undoable() == before  # retryable: the op set stays open
+    git(repo, "symbolic-ref", "HEAD", "refs/heads/main")
+    _, retry = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [i.status for i in retry] == ["restored"]
+    assert git(repo, "rev-parse", "HEAD") == outcome.before_head
+
+
+async def test_the_unparseable_branch_skip_applies_to_old_entries_too(make_repo, push_upstream, git, tmp_path):
+    repo, root, journal, outcome = await _pulled(make_repo, push_upstream, git, tmp_path)
+    git(repo, "symbolic-ref", "HEAD", "refs/remotes/origin/main")
+    _, items = await undo_last(root, journal, confirm_moved=_must_not_ask)
+    assert [(i.status, i.detail) for i in items] == [("skipped", ODD_BRANCH_DETAIL)]
+    assert journal.last_undoable() is not None
+
+
+async def test_a_missing_repo_is_still_the_permanent_skip(tmp_path):
+    journal = Journal(tmp_path)
+    journal.record("x", [JournalEntry(
+        repo=str(tmp_path / "gone"), op="pull", before_head="1" * 40, after_head="2" * 40, branch="main",
+    )])
+    _, items = await undo_last(tmp_path, journal, confirm_moved=_must_not_ask)
+    assert [(i.status, i.detail) for i in items] == [("skipped", "repo not found or not a git repository")]
+    assert journal.last_undoable() is None  # closed: nothing to retry

@@ -705,3 +705,46 @@ async def test_the_after_read_loop_has_an_overall_deadline(monkeypatch, tmp_path
 
 def test_the_after_read_deadline_default_is_thirty_seconds():
     assert bulk.AFTER_READ_DEADLINE == 30.0
+
+
+# ---- H7 item F: a repo listed twice is pulled once ---------------------------------------------
+
+@pytest.mark.parametrize("concurrency", [1, 2])
+async def test_a_repo_listed_twice_is_pulled_and_journaled_once(
+    monkeypatch, make_repo, push_upstream, tmp_path, concurrency
+):
+    root = tmp_path / "work"
+    a = make_repo("a")
+    push_upstream(a, "a.txt")
+    calls = []
+    real = bulk.pull
+
+    async def spy(repo, progress=None):
+        calls.append(repo)
+        await asyncio.sleep(0.05)  # long enough for a concurrent twin to start and collide
+        return await real(repo, progress)
+
+    monkeypatch.setattr(bulk, "pull", spy)
+    results = await pull_repos(root, [a, a], concurrency=concurrency)
+    assert calls == [a]
+    assert list(results) == [a] and isinstance(results[a], Ok)
+    op_set = Journal(root).last_undoable()
+    assert op_set.description == "pull 1 repos"
+    assert [e.repo for e in op_set.entries] == [str(a)]
+
+
+async def test_repos_that_resolve_to_the_same_path_are_one_repo_and_order_is_kept(
+    monkeypatch, make_repo, tmp_path
+):
+    a, b = make_repo("a"), make_repo("b")
+    alias = a.parent / "b" / ".." / "a"  # the same directory spelled another way
+    calls = []
+
+    async def fake(repo, progress=None):
+        calls.append(repo)
+        return UpToDate()
+
+    monkeypatch.setattr(bulk, "pull", fake)
+    results = await pull_repos(tmp_path / "work", [b, a, alias, b], concurrency=1)
+    assert calls == [b, a]  # first-seen order, one pull each
+    assert list(results) == [b, a]
