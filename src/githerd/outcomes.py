@@ -26,6 +26,7 @@ class UpToDate(BaseModel):
 class BlockedDirty(BaseModel):
     kind: Literal["blocked_dirty"] = "blocked_dirty"
     files: list[FileChange]
+    blocking: list[str] = Field(default_factory=list)  # paths git said would be overwritten
 
 
 class Diverged(BaseModel):
