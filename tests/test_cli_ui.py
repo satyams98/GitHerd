@@ -479,3 +479,33 @@ def test_interactive_undo_confirmation_says_some_when_the_count_is_unavailable(
     monkeypatch.setattr("builtins.input", lambda prompt="": "n")
     runner.invoke(app, ["undo", "--root", str(root)])
     assert "a is on 'main'; some newer commits will be dropped from it (kept in the reflog)" in console.export_text()
+
+
+# ---- H4 item 2: the interactive actions get the --timeout value -----------------------------
+
+def _capture_resolve(monkeypatch):
+    seen = {}
+
+    def fake(console, root, results, glyphs, **kwargs):
+        seen.update(kwargs)
+        return results
+
+    monkeypatch.setattr(cli, "resolve_attention", fake)
+    return seen
+
+
+def test_pull_passes_its_timeout_to_the_attention_actions(make_repo, monkeypatch, tmp_path):
+    _terminal(monkeypatch)
+    seen = _capture_resolve(monkeypatch)
+    make_repo("a")
+    result = runner.invoke(app, ["pull", "--root", str(tmp_path / "work"), "--timeout", "45"])
+    assert result.exit_code == 0, result.output
+    assert seen["timeout"] == 45.0
+
+
+def test_pull_passes_the_default_timeout_when_none_is_given(make_repo, monkeypatch, tmp_path):
+    _terminal(monkeypatch)
+    seen = _capture_resolve(monkeypatch)
+    make_repo("a")
+    assert runner.invoke(app, ["pull", "--root", str(tmp_path / "work")]).exit_code == 0
+    assert seen["timeout"] == 300.0

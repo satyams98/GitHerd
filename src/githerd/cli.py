@@ -149,7 +149,7 @@ def pull(
                     pull_repos(base, repos, concurrency=jobs, timeout=timeout, on_event=live.on_event)
                 )
             console.print(Text(summarize(results.values()), style="subject"))
-            results = resolve_attention(console, base, results, glyphs)
+            results = resolve_attention(console, base, results, glyphs, timeout=timeout)
             if _moved_any(results):
                 console.print(Text(UNDO_HINT, style="dim"))
         else:

@@ -41,6 +41,7 @@ class Diverged(BaseModel):
 class Conflict(BaseModel):
     kind: Literal["conflict"] = "conflict"
     files: list[str]
+    stash_kept: bool = False  # a stash-and-pull pop conflicted, so git kept the stash
 
 
 class AuthRequired(BaseModel):
@@ -56,6 +57,7 @@ class NetworkError(BaseModel):
 class Failed(BaseModel):
     kind: Literal["failed"] = "failed"
     message: str
+    retryable: bool = True  # False for deterministic failures that retrying cannot fix
 
 
 Outcome = Annotated[

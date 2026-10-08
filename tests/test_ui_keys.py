@@ -5,7 +5,7 @@ import types
 import pytest
 
 from githerd.ui.cards import SKIP, Action
-from githerd.ui.keys import choose_action, read_key
+from githerd.ui.keys import choose_action, flush_input, read_key
 from githerd.ui.theme import ASCII_GLYPHS, make_console
 
 ACTIONS = [Action("d", "diff", "diff"), Action("s", "stash_pull", "stash & pull"), SKIP]
@@ -63,8 +63,8 @@ def test_read_key_handles_plain_special_and_ctrl_c(monkeypatch):
     monkeypatch.setitem(sys.modules, "msvcrt", fake)
 
     assert read_key() == "a"
-    assert read_key() == ""  # \x00 prefix swallows the following code
-    assert read_key() == ""  # \xe0 prefix swallows the following code
+    assert read_key() == "\x00"  # \x00 prefix swallows the following code; "" means only "nothing came"
+    assert read_key() == "\x00"  # \xe0 prefix swallows the following code
     with pytest.raises(KeyboardInterrupt):
         read_key()
 
@@ -153,3 +153,91 @@ def test_read_key_non_windows_returns_char(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(sys, "stdin", io.StringIO("q"))
     assert read_key() == "q"
+
+
+# ---- H4 items 4 and 5: typed-ahead flush and special keys -----------------------------------
+
+def test_flush_runs_once_after_the_hint_bar_and_before_the_first_read():
+    con = console()
+    events = []
+
+    def flush():
+        events.append(("flush", con.file.getvalue()))
+
+    def reader():
+        events.append(("read", ""))
+        return "d"
+
+    choose_action(con, ACTIONS, ASCII_GLYPHS, reader, flush)
+    assert [name for name, _ in events] == ["flush", "read"]
+    assert "d diff | s stash & pull | k skip" in events[0][1]  # the hint bar was already printed
+
+
+def test_flush_is_called_exactly_once_however_many_keys_are_read():
+    calls = []
+    choose_action(console(), ACTIONS, ASCII_GLYPHS, keys("x", "y", "z", "d"), lambda: calls.append(1))
+    assert calls == [1]
+
+
+def test_an_exception_from_flush_is_swallowed():
+    def flush():
+        raise RuntimeError("console exploded")
+
+    assert choose_action(console(), ACTIONS, ASCII_GLYPHS, keys("d"), flush).id == "diff"
+
+
+def _fake_msvcrt(monkeypatch, pending):
+    consumed = []
+    fake = types.SimpleNamespace(
+        kbhit=lambda: bool(pending),
+        getwch=lambda: consumed.append(pending.pop(0)) or consumed[-1],
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    monkeypatch.setattr(sys, "platform", "win32")
+    return consumed
+
+
+def test_flush_input_drains_every_pending_key_on_windows(monkeypatch):
+    pending = ["a", "b", "\x00", "H", "c"]
+    consumed = _fake_msvcrt(monkeypatch, pending)
+    flush_input()
+    assert consumed == ["a", "b", "\x00", "H", "c"] and pending == []
+
+
+def test_flush_input_with_nothing_pending_reads_nothing(monkeypatch):
+    consumed = _fake_msvcrt(monkeypatch, [])
+    flush_input()
+    assert consumed == []
+
+
+def test_flush_input_tolerates_an_oserror(monkeypatch):
+    def boom():
+        raise OSError("no console")
+
+    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(kbhit=boom, getwch=boom))
+    monkeypatch.setattr(sys, "platform", "win32")
+    flush_input()  # must not raise
+
+
+def test_flush_input_is_a_no_op_off_windows(monkeypatch):
+    def boom():
+        raise AssertionError("msvcrt must not be touched off Windows")
+
+    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(kbhit=boom, getwch=boom))
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert flush_input() is None
+
+
+def test_special_key_sentinel_is_never_an_action_and_never_trips_the_dead_reader_rule():
+    seq = ["\x00"] * 200 + ["d"]  # a held arrow key, then a real choice
+    assert choose_action(console(), ACTIONS, ASCII_GLYPHS, keys(*seq)).id == "diff"
+
+
+def test_special_keys_reset_the_empty_counter():
+    seq = [""] * 49 + ["\x00"] + [""] * 49 + ["d"]
+    assert choose_action(console(), ACTIONS, ASCII_GLYPHS, keys(*seq)).id == "diff"
+
+
+def test_the_sentinel_does_not_select_an_action_even_if_one_is_bound_to_it():
+    odd = [Action("\x00", "weird", "weird"), SKIP]
+    assert choose_action(console(), odd, ASCII_GLYPHS, keys("\x00", "k")).id == "skip"

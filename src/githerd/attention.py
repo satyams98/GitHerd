@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Awaitable, Callable, Iterable
 
 from rich.console import Console
 from rich.text import Text
@@ -12,9 +12,9 @@ from githerd.diffs import FileDiff, file_diff
 from githerd.bulk import HeadMove, record_pulls
 from githerd.gitops import head_and_branch, pull
 from githerd.interactive import run_git_interactive
-from githerd.outcomes import BlockedDirty, FileChange, Outcome, describe
+from githerd.outcomes import BlockedDirty, Failed, FileChange, Outcome, describe
 from githerd.recover import stash_and_pull
-from githerd.textsafe import clean_message
+from githerd.textsafe import clean_message, safe_path
 from githerd.ui import keys
 from githerd.ui.cards import actions_for, needs_attention, render_card
 from githerd.ui.diffview import run_lazy_diff_viewer
@@ -64,17 +64,49 @@ def _mutate(repo: Path, heads: Heads, action: Callable[[], Outcome]) -> Outcome:
         _record_move(heads, repo, before, _head(repo)[0], branch)
 
 
+async def _bounded(work: Awaitable[Outcome], timeout: float | None) -> Outcome:
+    """Await ``work``; with a truthy ``timeout`` an overrun is cancelled and reported as ``Failed``.
+
+    ``None`` and ``0`` mean no timeout, like the bulk pull. Cancellation kills the git
+    process tree, and ``work`` gets to run its own clean-up (a stash is put back).
+    """
+    if not timeout:
+        return await work
+    limiter = asyncio.timeout(timeout)
+    try:
+        async with limiter:
+            return await work
+    except TimeoutError:
+        if limiter.expired():  # our deadline fired, not some TimeoutError inside the work
+            return Failed(message=f"timed out after {timeout:g}s")
+        raise
+
+
+def _note(console: Console, text: str) -> None:
+    console.print(Text(text, style="dim"))
+
+
 def _resolve_one(
     console: Console, repo: Path, outcome: Outcome, glyphs: Glyphs,
     read_key: Callable[[], str], viewer: Viewer, heads: Heads,
-) -> Outcome:
+    *, more: bool = False, timeout: float | None = None,
+) -> tuple[Outcome, bool]:
+    """Offer actions for one repo until it is settled; returns ``(outcome, stop)``.
+
+    ``more`` says other repos still need attention (it enables ``skip all``); ``stop`` is
+    True when the user chose ``skip all``, so the caller must leave the rest untouched.
+    """
+    label = safe_path(repo.name)
+
     def authenticate() -> Outcome:
-        run_git_interactive(repo, "fetch")  # git talks to the user; we never see credentials
-        return asyncio.run(pull(repo))
+        run_git_interactive(repo, "fetch")  # git talks to the user (not timed); we never see credentials
+        return asyncio.run(_bounded(pull(repo), timeout))
 
     while needs_attention(outcome):
         console.print(render_card(repo.name, outcome, glyphs))
-        action = keys.choose_action(console, actions_for(outcome), glyphs, read_key)
+        action = keys.choose_action(console, actions_for(outcome, more=more), glyphs, read_key)
+        if action.id == "skip_all":
+            return outcome, True
         if action.id == "skip":
             break
         if action.id == "diff" and isinstance(outcome, BlockedDirty):
@@ -88,17 +120,22 @@ def _resolve_one(
                 ))
             continue
         if action.id == "stash_pull":
+            _note(console, f"  stashing, pulling, restoring {label}...")
             try:
-                outcome = _mutate(repo, heads, lambda: asyncio.run(stash_and_pull(repo)))
+                outcome = _mutate(
+                    repo, heads, lambda: asyncio.run(_bounded(stash_and_pull(repo), timeout)),
+                )
             except BaseException:  # Ctrl+C: any stashed work may or may not have been put back
-                console.print(Text(STASH_NOTE, style="dim"))
+                _note(console, STASH_NOTE)
                 raise
         elif action.id == "auth":
+            _note(console, f"  running git fetch for {label} (git may ask for credentials)...")
             outcome = _mutate(repo, heads, authenticate)
         else:  # retry
-            outcome = _mutate(repo, heads, lambda: asyncio.run(pull(repo)))
-        console.print(Text(f"  {describe(outcome)}", style="dim"))
-    return outcome
+            _note(console, f"  pulling {label}...")
+            outcome = _mutate(repo, heads, lambda: asyncio.run(_bounded(pull(repo), timeout)))
+        _note(console, f"  {describe(outcome)}")
+    return outcome, False
 
 
 def resolve_attention(
@@ -109,14 +146,29 @@ def resolve_attention(
     *,
     read_key: Callable[[], str] | None = None,
     viewer: Viewer = _default_viewer,
+    timeout: float | None = None,
 ) -> dict[Path, Outcome]:
+    """Walk the repos that need attention, offering one card each, and return the final outcomes.
+
+    ``timeout`` (seconds, ``None``/``0`` = none) limits each pull or stash-and-pull action
+    the user starts; the interactive authenticate hand-off is never timed. Choosing
+    ``skip all`` leaves the current and every remaining repo as they are.
+
+    This runs its own event loops (``asyncio.run``) and blocks on the keyboard, so it must
+    not be called from a running event loop.
+    """
     reader = read_key or keys.read_key  # looked up at call time so it can be patched
     final = dict(results)  # never mutate the caller's mapping
     heads: Heads = {}
+    pending = [repo for repo, outcome in results.items() if needs_attention(outcome)]
     try:
-        for repo, outcome in results.items():
-            if needs_attention(outcome):
-                final[repo] = _resolve_one(console, repo, outcome, glyphs, reader, viewer, heads)
+        for index, repo in enumerate(pending):
+            final[repo], stop = _resolve_one(
+                console, repo, results[repo], glyphs, reader, viewer, heads,
+                more=index + 1 < len(pending), timeout=timeout,
+            )
+            if stop:
+                break
     finally:  # a Ctrl+C part-way through still journals what was already done
         moved = sum(1 for before, after, _ in heads.values() if before and after and before != after)
         _record_moves(root, f"resolve {moved} repos", heads)

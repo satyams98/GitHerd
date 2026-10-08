@@ -348,3 +348,27 @@ def test_parse_head_and_branch(stdout, expected):
     from githerd.gitops import parse_head_and_branch
 
     assert parse_head_and_branch(stdout) == expected
+
+
+# ---- H4 item 3: deterministic failures are not retryable ---------------------------------
+
+async def test_pull_without_an_upstream_is_not_retryable(tmp_path, git, commit_local):
+    solo = tmp_path / "solo"
+    solo.mkdir()
+    git(solo, "init", "-b", "main")
+    commit_local(solo, "a.txt")
+    outcome = await pull(solo)
+    assert isinstance(outcome, Failed) and outcome.retryable is False
+
+
+async def test_pull_on_a_detached_head_is_not_retryable(make_repo, git):
+    repo = make_repo("a")
+    git(repo, "checkout", "--detach")
+    outcome = await pull(repo)
+    assert isinstance(outcome, Failed) and outcome.retryable is False
+    assert outcome.message.startswith("detached HEAD")
+
+
+def test_an_ordinary_git_failure_stays_retryable():
+    outcome = classify_failure("fatal: something odd happened")
+    assert isinstance(outcome, Failed) and outcome.retryable is True

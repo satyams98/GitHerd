@@ -70,7 +70,7 @@ async def test_overlapping_edit_reports_conflict_and_keeps_the_stash(make_repo, 
     (repo / "README.md").write_text("local edit\n", encoding="utf-8")
     push_upstream(repo, "README.md", content="upstream edit\n")
     outcome = await stash_and_pull(repo)
-    assert outcome == Conflict(files=["README.md"])
+    assert outcome == Conflict(files=["README.md"], stash_kept=True)
     assert git(repo, "stash", "list") != ""
     assert_work_not_lost(repo, git, {"README.md": "local edit\n"})
 
@@ -313,3 +313,21 @@ async def test_failed_synchronous_restore_logs_a_warning_without_a_traceback(
     assert records and all(r.levelname == "WARNING" for r in records)
     assert all(r.exc_info is None for r in records)
     assert "cannot spawn git" in caplog.text
+
+
+# ---- H4 item 6: a conflicted pop says the stash was kept -----------------------------------
+
+async def test_a_conflicted_pop_is_flagged_as_keeping_the_stash(make_repo, push_upstream, git):
+    repo = make_repo("a")
+    (repo / "README.md").write_text("local edit\n", encoding="utf-8")
+    push_upstream(repo, "README.md", content="upstream edit\n")
+    outcome = await stash_and_pull(repo)
+    assert isinstance(outcome, Conflict) and outcome.stash_kept is True
+    assert "auto-stash" in git(repo, "stash", "list")  # git really did keep it
+
+
+async def test_a_clean_pop_does_not_produce_a_stash_flag(make_repo, push_upstream):
+    repo = make_repo("a")
+    (repo / "scratch.txt").write_text("s\n", encoding="utf-8")
+    push_upstream(repo, "other.txt")
+    assert isinstance(await stash_and_pull(repo), Ok)

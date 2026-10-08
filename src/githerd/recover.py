@@ -40,7 +40,7 @@ async def _pop(repo: Path, on_success: Outcome) -> Outcome:
         return on_success
     conflicts = await _conflicted_files(repo)
     if conflicts:
-        return Conflict(files=conflicts)  # git keeps the stash on a conflicted pop
+        return Conflict(files=conflicts, stash_kept=True)  # git keeps the stash on a conflicted pop
     return Failed(
         message="your stashed changes could not be re-applied; "
         f"they are kept in `git stash`: {_last_line(pop.stderr)}"

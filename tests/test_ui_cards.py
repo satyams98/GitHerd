@@ -100,3 +100,47 @@ def test_conflict_card_collapses_long_file_lists_with_a_more_line():
     assert "+3 more" in text
     short = render_plain(render_card("api", Conflict(files=["a.txt", "b.txt"]), ASCII_GLYPHS))
     assert "more" not in short
+
+
+# ---- H4 items 3, 6, 7: non-retryable failures, kept stash, skip all -----------------------
+
+def test_a_non_retryable_failure_offers_only_skip():
+    outcome = Failed(message="detached HEAD: switch to a branch before pulling", retryable=False)
+    assert [a.id for a in actions_for(outcome)] == ["skip"]
+    assert [a.id for a in actions_for(Failed(message="x"))] == ["retry", "skip"]
+
+
+def test_skip_all_is_offered_only_when_more_repos_remain():
+    ids = lambda o, **kw: [a.id for a in actions_for(o, **kw)]  # noqa: E731
+    assert ids(BlockedDirty(files=[]), more=True) == ["diff", "stash_pull", "skip", "skip_all"]
+    assert ids(AuthRequired(remote="o"), more=True) == ["auth", "skip", "skip_all"]
+    assert ids(NetworkError(message="x"), more=True) == ["retry", "skip", "skip_all"]
+    assert ids(Failed(message="x"), more=True) == ["retry", "skip", "skip_all"]
+    assert ids(Failed(message="x", retryable=False), more=True) == ["skip", "skip_all"]
+    assert ids(Diverged(ahead=1, behind=1), more=True) == ["skip", "skip_all"]
+    assert ids(Conflict(files=["a"]), more=True) == ["skip", "skip_all"]
+    assert ids(OK, more=True) == [] and ids(UpToDate(), more=True) == []
+    assert ids(Failed(message="x"), more=False) == ["retry", "skip"]
+    assert ids(Failed(message="x")) == ["retry", "skip"]
+
+
+def test_the_skip_all_action_is_bound_to_x():
+    action = actions_for(Failed(message="x"), more=True)[-1]
+    assert (action.key, action.id, action.label) == ("x", "skip_all", "skip all")
+    assert hint_bar(actions_for(Failed(message="x"), more=True), ASCII_GLYPHS).plain == (
+        "r retry | k skip | x skip all"
+    )
+
+
+KEPT_NOTE = "your changes are kept in 'git stash'; fix the conflicts, then run: git stash drop"
+
+
+def test_a_conflict_that_kept_the_stash_says_so():
+    text = render_plain(render_card("api", Conflict(files=["a.txt"], stash_kept=True), ASCII_GLYPHS))
+    assert KEPT_NOTE in " ".join(text.split())  # the 80-column test console may wrap the line
+    assert text.isascii()
+    assert text.index("a.txt") < text.index("your changes are kept")
+
+
+def test_a_plain_conflict_has_no_stash_note():
+    assert "git stash" not in render_plain(render_card("api", Conflict(files=["a.txt"]), ASCII_GLYPHS))

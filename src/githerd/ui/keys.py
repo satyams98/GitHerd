@@ -11,38 +11,62 @@ from githerd.ui.theme import Glyphs
 KeyReader = Callable[[], str]
 
 MAX_CONSECUTIVE_EMPTY = 50
+SPECIAL_KEY = "\x00"  # what read_key returns for an arrow/function key; "" means "nothing came"
 
 
 def read_key() -> str:
-    """Read one key press from the console without waiting for Enter."""
+    """Read one key press from the console without waiting for Enter.
+
+    Special keys (arrows, function keys) are swallowed and reported as ``SPECIAL_KEY``,
+    which is never empty: an empty string means only that nothing came (a dead console).
+    """
     if sys.platform == "win32":
         import msvcrt
 
         ch = msvcrt.getwch()
         if ch in ("\x00", "\xe0"):  # arrow/function keys send a two-part code
             msvcrt.getwch()
-            return ""
+            return SPECIAL_KEY
         if ch == "\x03":
             raise KeyboardInterrupt
         return ch
-    # Non-Windows fallback; githerd targets Windows. There "" is the legitimate
-    # "special key swallowed" sentinel, but here it means stdin hit EOF.
+    # Non-Windows fallback; githerd targets Windows. Here "" means stdin hit EOF.
     ch = sys.stdin.read(1)
     if ch == "":
         raise EOFError
     return ch
 
 
+def flush_input() -> None:
+    """Discard keys typed while something else was running (Windows console only).
+
+    Without this, a key pressed during a slow action would answer the NEXT card.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import msvcrt
+
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+    except OSError:  # no console to drain: nothing to flush
+        pass
+
+
 def choose_action(
-    console: Console, actions: list[Action], glyphs: Glyphs, read_key: KeyReader = read_key
+    console: Console, actions: list[Action], glyphs: Glyphs,
+    read_key: KeyReader = read_key, flush: Callable[[], None] = flush_input,
 ) -> Action:
     """Show the hint bar and block until the user presses a key bound to an action.
 
-    Keys match case-insensitively on both sides. Escape selects the ``skip`` action
-    when one is offered. If the reader raises EOFError/OSError, or returns an empty
-    string ``MAX_CONSECUTIVE_EMPTY`` times in a row (a dead console), ``skip`` is
-    returned when offered; otherwise the error propagates (EOFError for the dead
-    reader case), because there is no safe default action to choose.
+    Typed-ahead keys are discarded with ``flush`` (called once, after the hint bar is
+    printed and before the first read; an exception from it is ignored). Keys match
+    case-insensitively on both sides. Escape selects the ``skip`` action when one is
+    offered. The ``SPECIAL_KEY`` sentinel (an arrow key) is ignored and counts as a real
+    key. If the reader raises EOFError/OSError, or returns an empty string
+    ``MAX_CONSECUTIVE_EMPTY`` times in a row (a dead console), ``skip`` is returned when
+    offered; otherwise the error propagates (EOFError for the dead reader case),
+    because there is no safe default action to choose.
 
     Raises ValueError for an empty action list or duplicate action keys.
     """
@@ -57,6 +81,10 @@ def choose_action(
 
     skip = next((a for a in actions if a.id == "skip"), None)
     console.print(hint_bar(actions, glyphs))
+    try:
+        flush()
+    except Exception:  # flushing is a courtesy; never let it block the choice
+        pass
     empties = 0
     while True:
         try:
@@ -71,6 +99,8 @@ def choose_action(
             if skip is not None:
                 return skip
             raise
+        if key == SPECIAL_KEY:  # an arrow key: ignored, and proof the console is alive
+            continue
         if key == "\x1b" and skip is not None:
             return skip
         for action in actions:

@@ -70,7 +70,7 @@ def test_stash_and_pull_conflict_is_shown_then_skipped(make_repo, push_upstream,
     final = resolve_attention(
         console, tmp_path, {repo: outcome}, ASCII_GLYPHS, read_key=keys("s", "k"),
     )
-    assert final[repo] == Conflict(files=["README.md"])
+    assert final[repo] == Conflict(files=["README.md"], stash_kept=True)
     out = console.file.getvalue()
     assert "conflict in 1 file" in out
 
@@ -373,3 +373,246 @@ def test_the_real_lazy_viewer_loads_through_the_sync_loader(make_repo, push_upst
         assert not worker.is_alive(), "the viewer did not exit"
     (state,) = states
     assert "+local edit" in state.text
+
+
+# ---- H4 item 1: feedback before a slow action ------------------------------------------------
+
+def _fast(monkeypatch, name, outcome):
+    async def fake(repo, on_progress=None):
+        return outcome
+
+    monkeypatch.setattr(attention, name, fake)
+
+
+def test_retry_prints_a_pulling_line_before_the_outcome(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    console = make()
+    _fast(monkeypatch, "pull", UpToDate())
+    resolve_attention(console, tmp_path, {repo: Failed(message="x")}, ASCII_GLYPHS, read_key=keys("r"))
+    lines = console.file.getvalue().splitlines()
+    assert lines.index("  pulling a...") < lines.index("  already up to date")
+
+
+def test_stash_and_pull_prints_its_own_feedback_line(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    console = make()
+    _fast(monkeypatch, "stash_and_pull", UpToDate())
+    resolve_attention(console, tmp_path, {repo: BlockedDirty(files=[])}, ASCII_GLYPHS, read_key=keys("s"))
+    lines = console.file.getvalue().splitlines()
+    assert lines.index("  stashing, pulling, restoring a...") < lines.index("  already up to date")
+
+
+def test_authenticate_prints_a_credentials_warning_before_handing_off(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    console = make()
+    seen = []
+    monkeypatch.setattr(
+        attention, "run_git_interactive", lambda r, *a: seen.append(console.file.getvalue()) or 0,
+    )
+    _fast(monkeypatch, "pull", UpToDate())
+    resolve_attention(
+        console, tmp_path, {repo: AuthRequired(remote="origin")}, ASCII_GLYPHS, read_key=keys("a"),
+    )
+    line = "  running git fetch for a (git may ask for credentials)..."
+    assert line in seen[0]  # already on screen when git takes over the terminal
+    assert console.file.getvalue().splitlines().index(line) < console.file.getvalue().splitlines().index(
+        "  already up to date"
+    )
+
+
+def test_the_feedback_label_is_sanitised(tmp_path, monkeypatch):
+    repo = tmp_path / "evil‮\x1b[2Jname"  # never touches the file system
+    console = make()
+    _fast(monkeypatch, "pull", UpToDate())
+    resolve_attention(console, tmp_path, {repo: Failed(message="x")}, ASCII_GLYPHS, read_key=keys("r"))
+    out = console.file.getvalue()
+    assert "  pulling evil?name..." in out
+    assert "\x1b" not in out and "‮" not in out
+
+
+# ---- H4 item 2: actions honour the pull timeout ----------------------------------------------
+
+async def _hangs(repo, on_progress=None):
+    await asyncio.sleep(30)
+    return UpToDate()
+
+
+def test_a_slow_retry_times_out_as_failed(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    monkeypatch.setattr(attention, "pull", _hangs)
+    final = resolve_attention(
+        make(), tmp_path, {repo: Failed(message="x")}, ASCII_GLYPHS,
+        read_key=keys("r", "k"), timeout=0.2,
+    )
+    assert final[repo] == Failed(message="timed out after 0.2s")
+
+
+def test_a_slow_stash_and_pull_times_out_as_failed(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    monkeypatch.setattr(attention, "stash_and_pull", _hangs)
+    console = make()
+    final = resolve_attention(
+        console, tmp_path, {repo: BlockedDirty(files=[])}, ASCII_GLYPHS,
+        read_key=keys("s", "k"), timeout=0.2,
+    )
+    assert final[repo] == Failed(message="timed out after 0.2s")
+    assert "failed: timed out after 0.2s" in console.file.getvalue()
+
+
+def test_a_slow_pull_after_authenticating_times_out(make_repo, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    monkeypatch.setattr(attention, "run_git_interactive", lambda r, *a: 0)
+    monkeypatch.setattr(attention, "pull", _hangs)
+    final = resolve_attention(
+        make(), tmp_path, {repo: AuthRequired(remote="o")}, ASCII_GLYPHS,
+        read_key=keys("a", "k"), timeout=0.2,
+    )
+    assert final[repo] == Failed(message="timed out after 0.2s")
+
+
+@pytest.mark.parametrize("timeout", [None, 0])
+def test_no_timeout_means_the_action_is_not_limited(make_repo, monkeypatch, tmp_path, timeout):
+    repo = make_repo("a")
+
+    async def slowish(repo, on_progress=None):
+        await asyncio.sleep(0.3)
+        return UpToDate()
+
+    monkeypatch.setattr(attention, "pull", slowish)
+    final = resolve_attention(
+        make(), tmp_path, {repo: Failed(message="x")}, ASCII_GLYPHS,
+        read_key=keys("r"), timeout=timeout,
+    )
+    assert final[repo] == UpToDate()
+
+
+def test_the_interactive_authenticate_hand_off_is_not_timed(make_repo, monkeypatch, tmp_path):
+    import time
+
+    repo = make_repo("a")
+    monkeypatch.setattr(attention, "run_git_interactive", lambda r, *a: time.sleep(0.5) or 0)
+    _fast(monkeypatch, "pull", UpToDate())
+    final = resolve_attention(
+        make(), tmp_path, {repo: AuthRequired(remote="o")}, ASCII_GLYPHS,
+        read_key=keys("a"), timeout=0.1,  # the user is typing: only the pull after it is limited
+    )
+    assert final[repo] == UpToDate()
+
+
+def test_a_head_move_before_the_timeout_is_still_journaled(make_repo, push_upstream, git, monkeypatch, tmp_path):
+    repo = make_repo("a")
+    push_upstream(repo, "new.txt")
+    git(repo, "fetch")
+    root = tmp_path / "work"
+
+    async def moves_then_hangs(path, on_progress=None):
+        git(path, "reset", "--hard", "origin/main")  # HEAD moves, then the pull never finishes
+        await asyncio.sleep(30)
+        return UpToDate()
+
+    monkeypatch.setattr(attention, "pull", moves_then_hangs)
+    final = resolve_attention(
+        make(), root, {repo: Failed(message="x")}, ASCII_GLYPHS, read_key=keys("r", "k"), timeout=0.5,
+    )
+    assert final[repo] == Failed(message="timed out after 0.5s")
+    (entry,) = Journal(root).last_undoable().entries
+    assert entry.repo == str(repo) and entry.after_head != entry.before_head and entry.branch == "main"
+
+
+# ---- H4 item 3: a non-retryable failure offers no retry ---------------------------------------
+
+def test_a_non_retryable_failure_shows_no_retry_key(make_repo, tmp_path):
+    repo = make_repo("a")
+    console = make()
+    outcome = Failed(message="detached HEAD: switch to a branch before pulling", retryable=False)
+    final = resolve_attention(console, tmp_path, {repo: outcome}, ASCII_GLYPHS, read_key=keys("r", "k"))
+    out = console.file.getvalue()
+    assert "retry" not in out and "k skip" in out
+    assert final[repo] == outcome  # the stray `r` did nothing
+
+
+# ---- H4 item 7: skip all ------------------------------------------------------------------------
+
+def _three(make_repo, outcome=None):
+    repos = [make_repo(n) for n in ("a", "b", "c")]
+    return repos, {r: outcome or Failed(message=f"boom {r.name}") for r in repos}
+
+
+def _no_pull(monkeypatch):
+    async def forbidden(repo, on_progress=None):
+        raise AssertionError("nothing may be pulled after skip all")
+
+    monkeypatch.setattr(attention, "pull", forbidden)
+
+
+def test_skip_all_on_the_first_card_touches_nothing_and_reads_no_more_keys(make_repo, monkeypatch, tmp_path):
+    repos, results = _three(make_repo)
+    _no_pull(monkeypatch)
+    console = make()
+    final = resolve_attention(console, tmp_path, results, ASCII_GLYPHS, read_key=keys("x"))
+    assert final == results
+    out = console.file.getvalue()
+    assert "boom a" in out and "boom b" not in out and "boom c" not in out  # no further cards
+
+
+def test_skip_then_skip_all_leaves_the_second_and_third_alone(make_repo, monkeypatch, tmp_path):
+    repos, results = _three(make_repo)
+    _no_pull(monkeypatch)
+    console = make()
+    final = resolve_attention(console, tmp_path, results, ASCII_GLYPHS, read_key=keys("k", "x"))
+    assert final == results
+    out = console.file.getvalue()
+    assert "boom b" in out and "boom c" not in out
+
+
+def test_skip_all_keeps_the_outcome_a_failed_retry_left_behind(make_repo, monkeypatch, tmp_path):
+    repos, results = _three(make_repo)
+    calls = []
+
+    async def still_failing(repo, on_progress=None):
+        calls.append(repo)
+        return Failed(message="still failing")
+
+    monkeypatch.setattr(attention, "pull", still_failing)
+    final = resolve_attention(make(), tmp_path, results, ASCII_GLYPHS, read_key=keys("r", "x"))
+    assert calls == [repos[0]]
+    assert final[repos[0]] == Failed(message="still failing")
+    assert final[repos[1]] == results[repos[1]] and final[repos[2]] == results[repos[2]]
+
+
+def test_skip_all_is_offered_only_while_more_repos_need_attention(make_repo, tmp_path):
+    repos, results = _three(make_repo)
+    console = make()
+    resolve_attention(console, tmp_path, results, ASCII_GLYPHS, read_key=keys("k", "k", "k"))
+    out = console.file.getvalue()
+    assert out.count("x skip all") == 2  # not on the last card
+    last_card = out[out.index("boom c"):]
+    assert "x skip all" not in last_card
+
+
+def test_a_single_repo_never_offers_skip_all(make_repo, tmp_path):
+    repo = make_repo("a")
+    console = make()
+    resolve_attention(console, tmp_path, {repo: Failed(message="x")}, ASCII_GLYPHS, read_key=keys("k"))
+    assert "skip all" not in console.file.getvalue()
+
+
+def test_repos_that_need_nothing_do_not_count_as_remaining(make_repo, tmp_path):
+    needy, fine = make_repo("a"), make_repo("b")
+    console = make()
+    resolve_attention(
+        console, tmp_path, {needy: Failed(message="x"), fine: UpToDate()}, ASCII_GLYPHS, read_key=keys("k"),
+    )
+    assert "skip all" not in console.file.getvalue()
+
+
+def test_skip_all_still_journals_work_already_done(make_repo, push_upstream, tmp_path):
+    first, second, third = make_repo("a"), make_repo("b"), make_repo("c")
+    push_upstream(first, "new.txt")
+    root = tmp_path / "work"
+    results = {first: Failed(message="1"), second: Failed(message="2"), third: Failed(message="3")}
+    final = resolve_attention(make(), root, results, ASCII_GLYPHS, read_key=keys("r", "x"))
+    assert isinstance(final[first], Ok)
+    assert final[second] == results[second] and final[third] == results[third]
+    (entry,) = Journal(root).last_undoable().entries
+    assert entry.repo == str(first)

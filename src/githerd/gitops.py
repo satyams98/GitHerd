@@ -192,9 +192,12 @@ async def pull(repo: Path, on_progress: ProgressCb | None = None) -> Outcome:
 async def _pull(repo: Path, on_progress: ProgressCb | None) -> Outcome:
     snap = await snapshot(repo)
     if snap.branch is None:
-        return Failed(message="detached HEAD: switch to a branch before pulling")
+        return Failed(message="detached HEAD: switch to a branch before pulling", retryable=False)
     if snap.upstream is None:
-        return Failed(message=clean_message(f"branch '{snap.branch}' has no upstream configured"))
+        return Failed(
+            message=clean_message(f"branch '{snap.branch}' has no upstream configured"),
+            retryable=False,
+        )
     before = snap.head
     res = await run_git(repo, "pull", "--ff-only", "--progress", on_progress=on_progress)
     if not res.ok:

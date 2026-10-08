@@ -34,3 +34,24 @@ def test_describe_each_outcome():
     assert describe(AuthRequired(remote="origin")) == "needs credentials"
     assert describe(NetworkError(message="timed out")) == "network error: timed out"
     assert describe(Failed(message="boom")) == "failed: boom"
+
+
+# ---- H4 items 3 and 6: non-retryable failures and the kept-stash flag -------------------
+
+def test_failed_is_retryable_by_default_and_old_data_still_loads():
+    adapter = TypeAdapter(Outcome)
+    assert Failed(message="x").retryable is True
+    old = adapter.validate_python({"kind": "failed", "message": "x"})  # written before the field existed
+    assert old == Failed(message="x") and old.retryable is True
+    fixed = Failed(message="x", retryable=False)
+    restored = adapter.validate_python(adapter.dump_python(fixed))
+    assert restored == fixed and restored.retryable is False
+
+
+def test_conflict_stash_kept_defaults_to_false_and_round_trips():
+    adapter = TypeAdapter(Outcome)
+    assert Conflict(files=["a"]).stash_kept is False
+    old = adapter.validate_python({"kind": "conflict", "files": ["a"]})
+    assert old == Conflict(files=["a"])
+    kept = Conflict(files=["a"], stash_kept=True)
+    assert adapter.validate_python(adapter.dump_python(kept)) == kept

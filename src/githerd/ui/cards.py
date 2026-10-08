@@ -21,22 +21,39 @@ class Action:
 
 
 SKIP = Action("k", "skip", "skip")
+SKIP_ALL = Action("x", "skip_all", "skip all")
+
+STASH_KEPT_NOTE = "    your changes are kept in 'git stash'; fix the conflicts, then run: git stash drop"
 
 
 def needs_attention(outcome: Outcome) -> bool:
     return not isinstance(outcome, (Ok, UpToDate))
 
 
-def actions_for(outcome: Outcome) -> list[Action]:
+def _base_actions(outcome: Outcome) -> list[Action]:
     if isinstance(outcome, BlockedDirty):
         return [Action("d", "diff", "diff"), Action("s", "stash_pull", "stash & pull"), SKIP]
     if isinstance(outcome, AuthRequired):
         return [Action("a", "auth", "authenticate"), SKIP]
+    if isinstance(outcome, Failed) and not outcome.retryable:
+        return [SKIP]  # a deterministic failure: retrying would fail the same way
     if isinstance(outcome, (NetworkError, Failed)):
         return [Action("r", "retry", "retry"), SKIP]
     if isinstance(outcome, (Diverged, Conflict)):
         return [SKIP]
     return []
+
+
+def actions_for(outcome: Outcome, *, more: bool = False) -> list[Action]:
+    """The keys offered for ``outcome``; ``more`` says other repos still need attention.
+
+    ``skip all`` is appended after ``skip`` only when ``more`` is true and the outcome
+    offers any action at all.
+    """
+    actions = _base_actions(outcome)
+    if more and actions:
+        actions.append(SKIP_ALL)
+    return actions
 
 
 def hint_bar(actions: list[Action], glyphs: Glyphs) -> Text:
@@ -100,6 +117,8 @@ def render_card(name: str, outcome: Outcome, glyphs: Glyphs, *, max_files: int =
         hidden = len(outcome.files) - max_files
         if hidden > 0:
             lines.append(Text(f"    +{hidden} more", style="dim"))
+        if outcome.stash_kept:
+            lines.append(Text(STASH_KEPT_NOTE, style="dim"))
     elif isinstance(outcome, AuthRequired) and outcome.remote:
         lines.append(Text(f"    remote: {safe_path(outcome.remote)}", style="dim"))
     return Group(*lines)
