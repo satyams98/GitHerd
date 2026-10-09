@@ -5,14 +5,14 @@ import logging
 import subprocess
 from pathlib import Path
 
-from githerd.gitops import pull
+from githerd.gitops import PULL_COMMAND, pull
 from githerd.outcomes import Conflict, Failed, Ok, Outcome, UpToDate
 from githerd.runner import ProgressCb, git_env, run_git
 from githerd.textsafe import clean_message
 
 STASH_MESSAGE = "githerd: auto-stash before pull"
-# What stash_and_pull runs, shown (dim) before the action; keep it in step with the code below.
-STASH_PULL_COMMAND = "git stash push --include-untracked ; git pull --ff-only ; git stash pop"
+# What stash_and_pull runs, shown (dim) before the action; the pull part is the real PULL_COMMAND.
+STASH_PULL_COMMAND = f"git stash push --include-untracked ; {PULL_COMMAND} ; git stash pop"
 
 log = logging.getLogger("githerd.recover")
 

@@ -338,3 +338,16 @@ def test_without_labels_rows_show_the_directory_name():
     repos = [Path("/w/a/api"), Path("/w/docs")]
     dash = Dashboard(repos, {}, ASCII_GLYPHS)
     assert [r.name for r in dash.rows.values()] == ["api", "docs"]
+
+
+def test_two_long_labels_stay_distinguishable_in_dashboard_rows():
+    a = Path("/w/very-long-organisation-name/a/api")
+    b = Path("/w/very-long-organisation-name/b/api")
+    labels = {a: "very-long-organisation-name/a/api", b: "very-long-organisation-name/b/api"}
+    for glyphs in (ASCII_GLYPHS, UNICODE_GLYPHS):
+        dash = Dashboard([a, b], {}, glyphs, labels=labels)
+        first, second = [ln for ln in render_plain(dash, 80).splitlines() if "queued" in ln]
+        assert "/a/api" in first and "/b/api" in second
+        assert first.split("  ")[0] != second.split("  ")[0]
+        assert first.index("queued") == second.index("queued")  # columns stay aligned
+        assert cell_len(first) <= 80 and cell_len(second) <= 80

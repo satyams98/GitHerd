@@ -38,7 +38,7 @@ def test_a_duplicate_that_is_the_root_itself_uses_the_absolute_path(tmp_path):
     assert labels[root] == root.as_posix()  # "." would say nothing
 
 
-OVERRIDE = chr(0x202E)  # a bidi override, built from its code point (no raw bidi controls in tests)
+OVERRIDE = "\u202e"  # a bidi override, written as an escape (no raw bidi controls in tests)
 HOSTILE = f"evil{OVERRIDE}\x1b[2Jname"
 
 
@@ -60,3 +60,34 @@ def test_a_unique_hostile_name_is_sanitised_too(tmp_path):
 def test_no_repos_gives_no_labels(tmp_path):
     assert display_names([], tmp_path) == {}
     assert display_names([Path("x")], Path(".")) == {Path("x"): "x"}
+
+
+# ---- duplicates are judged the way the file system and the screen see them -------------------------
+
+def test_names_differing_only_in_case_are_duplicates_on_windows(tmp_path, monkeypatch):
+    from githerd import names
+
+    monkeypatch.setattr(names, "_CASE_INSENSITIVE", True)
+    upper, lower = tmp_path / "x" / "API", tmp_path / "y" / "api"
+    assert display_names([upper, lower], tmp_path) == {upper: "x/API", lower: "y/api"}
+
+
+def test_names_differing_only_in_case_stay_distinct_where_the_file_system_is_case_sensitive(tmp_path, monkeypatch):
+    from githerd import names
+
+    monkeypatch.setattr(names, "_CASE_INSENSITIVE", False)
+    upper, lower = tmp_path / "x" / "API", tmp_path / "y" / "api"
+    assert display_names([upper, lower], tmp_path) == {upper: "API", lower: "api"}
+
+
+def test_names_that_become_equal_after_sanitising_are_duplicates(tmp_path):
+    first, second = tmp_path / "x" / "a\u202eb", tmp_path / "y" / "a\u202db"  # both print as a?b
+    assert display_names([first, second], tmp_path) == {first: "x/a?b", second: "y/a?b"}
+
+
+def test_a_name_that_equals_another_only_after_sanitising_and_case_folding_is_a_duplicate(tmp_path, monkeypatch):
+    from githerd import names
+
+    monkeypatch.setattr(names, "_CASE_INSENSITIVE", True)
+    first, second = tmp_path / "x" / "A\u202eB", tmp_path / "y" / "a\u202db"
+    assert display_names([first, second], tmp_path) == {first: "x/A?B", second: "y/a?b"}

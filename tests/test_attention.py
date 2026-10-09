@@ -751,8 +751,8 @@ def test_two_files_walked_with_n_then_q_load_each_once_inside_the_running_loop(
 
 # ---- H5 item 2: the feedback lines quietly show the real git command ----------------------------
 
-STASH_PULL_CMD = "    $ git stash push --include-untracked ; git pull --ff-only ; git stash pop"
-RETRY_CMD = "    $ git pull --ff-only"
+STASH_PULL_CMD = "    $ git stash push --include-untracked ; git pull --ff-only --progress ; git stash pop"
+RETRY_CMD = "    $ git pull --ff-only --progress"
 AUTH_CMD = "    $ git fetch"
 
 
@@ -760,7 +760,7 @@ def test_the_command_constants_live_next_to_the_code_that_runs_them():
     assert recover.STASH_PULL_COMMAND == STASH_PULL_CMD.strip()[2:]
     from githerd import gitops
 
-    assert gitops.PULL_FF_COMMAND == RETRY_CMD.strip()[2:]
+    assert gitops.PULL_COMMAND == RETRY_CMD.strip()[2:]
     assert gitops.FETCH_COMMAND == AUTH_CMD.strip()[2:]
 
 
@@ -855,11 +855,11 @@ def test_a_label_is_sanitised_and_missing_labels_fall_back_to_the_name(make_repo
     _fast(monkeypatch, "pull", UpToDate())
     resolve_attention(
         console, tmp_path, {repo: Failed(message="x"), other: Failed(message="y")}, ASCII_GLYPHS,
-        read_key=keys("r", "r"), labels={repo: f"evil{chr(0x202E)}\x1b[2Jname"},
+        read_key=keys("r", "r"), labels={repo: "evil\u202e\x1b[2Jname"},
     )
     out = console.file.getvalue()
     assert "  pulling evil?name..." in out and "  pulling b..." in out
-    assert "\x1b" not in out and chr(0x202E) not in out
+    assert "\x1b" not in out and "\u202e" not in out
 
 
 # ---- H9: the timeout note is exact -----------------------------------------------------------------------
@@ -929,3 +929,49 @@ def test_an_unreadable_stash_tip_before_the_action_falls_back_to_the_old_check(
         console, tmp_path, {repo: outcome}, ASCII_GLYPHS, read_key=keys("s", "k"), timeout=2,
     )
     assert STASH_NOTE in console.file.getvalue()  # unsure, so err on the side of telling the user
+
+
+# ---- the displayed pull command is derived from what the code runs ---------------------------------------
+
+def test_every_displayed_pull_command_is_derived_from_pull_args():
+    from githerd import gitops
+
+    real = " ".join(["git", *gitops.PULL_ARGS])
+    assert gitops.PULL_COMMAND == real
+    assert not hasattr(gitops, "PULL_FF_COMMAND")  # no second, hand-written copy to drift
+    assert recover.STASH_PULL_COMMAND == f"git stash push --include-untracked ; {real} ; git stash pop"
+    assert RETRY_CMD == f"    $ {real}"
+
+
+def test_pull_runs_exactly_the_command_that_is_displayed(make_repo, monkeypatch):
+    from githerd import gitops
+
+    seen = []
+    real_run_git = gitops.run_git
+
+    async def spy(repo, *args, **kwargs):
+        seen.append(" ".join(["git", *args]))
+        return await real_run_git(repo, *args, **kwargs)
+
+    monkeypatch.setattr(gitops, "run_git", spy)
+    asyncio.run(gitops.pull(make_repo("a")))
+    assert gitops.PULL_COMMAND in seen
+
+
+def test_authenticate_shows_the_fetch_and_then_the_pull_it_runs(make_repo, monkeypatch, tmp_path):
+    from githerd import gitops
+
+    repo = make_repo("a")
+    console = make()
+    seen = []
+    monkeypatch.setattr(
+        attention, "run_git_interactive", lambda r, *a: seen.append(console.file.getvalue()) or 0,
+    )
+    _fast(monkeypatch, "pull", UpToDate())
+    resolve_attention(
+        console, tmp_path, {repo: AuthRequired(remote="origin")}, ASCII_GLYPHS, read_key=keys("a"),
+    )
+    lines = seen[0].splitlines()
+    start = lines.index("  running git fetch for a (git may ask for credentials)...")
+    assert lines[start + 1] == AUTH_CMD
+    assert lines[start + 2] == "    $ " + " ".join(["git", *gitops.PULL_ARGS])

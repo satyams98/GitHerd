@@ -114,6 +114,11 @@ def _finite_timeout(value: float) -> float:
     return value
 
 
+def _undo_labels(base: Path, journaled: list[Path]) -> dict[Path, str]:
+    """Labels for every repo under ``base`` and every ``journaled`` one (which may be gone or elsewhere)."""
+    return display_names(list(dict.fromkeys([*discover_repos(base), *journaled])), base)
+
+
 @app.command()
 def status(root: RootOpt = None) -> None:
     """Show branch, sync state and local changes for every repo."""
@@ -203,13 +208,19 @@ def undo(root: RootOpt = None) -> None:
     console = make_console()
     glyphs = glyphs_for(console)
     base = _base(root)
+    journal = Journal(base)
+    # ONE label map for everything undo prints (the prompt and the result lines): the repos under
+    # the root plus the journaled ones, labelled exactly as pull and status label them, so a
+    # duplicate name stays disambiguated even when only one of the duplicates was journaled.
+    pending = journal.last_undoable()
+    labels = _undo_labels(base, [Path(e.repo) for e in pending.entries]) if pending else {}
 
     confirm = None
     interactive = _interactive(console)
     if interactive:
         def confirm(entry, current: str) -> bool:
-            name = Path(entry.repo).name
             repo = Path(entry.repo)
+            name = labels.get(repo) or safe_path(repo.name)
             branch = entry.branch or (head_and_branch_sync(repo) or ("", None))[1] or "?"
             count = git_sync(repo, "rev-list", "--count", f"{entry.after_head}..{current}")
             if count is not None and count.isdigit() and int(count) >= 1:
@@ -228,7 +239,7 @@ def undo(root: RootOpt = None) -> None:
 
     options = {"confirm_moved": confirm} if confirm is not None else {}
     with _interrupts(console):
-        op_set, items = asyncio.run(undo_last(base, Journal(base), **options))
+        op_set, items = asyncio.run(undo_last(base, journal, **options))
     if op_set is None:
         console.print("Nothing to undo.")
         return
@@ -240,10 +251,9 @@ def undo(root: RootOpt = None) -> None:
         "skipped": (glyphs.attn, "warn"),
         "failed": (glyphs.fail, "error"),
     }
-    paths = list(dict.fromkeys(
-        [Path(e.repo) for e in op_set.entries] + [Path(item.repo) for item in items]
-    ))
-    labels = display_names(paths, base)
+    paths = [Path(e.repo) for e in op_set.entries] + [Path(item.repo) for item in items]
+    if any(path not in labels for path in paths):  # not what was journaled (a stand-in undo, say)
+        labels = _undo_labels(base, paths)
     for item in items:
         glyph, style = styles[item.status]
         line = Text()

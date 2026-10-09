@@ -10,7 +10,7 @@ from rich.text import Text
 from githerd.asyncutil import run_coro_sync
 from githerd.diffs import FileDiff, file_diff
 from githerd.bulk import HeadMove, record_pulls, validate_timeout
-from githerd.gitops import FETCH_COMMAND, PULL_FF_COMMAND, head_and_branch, pull
+from githerd.gitops import FETCH_COMMAND, PULL_COMMAND, head_and_branch, pull
 from githerd.interactive import run_git_interactive
 from githerd.outcomes import BlockedDirty, Failed, FileChange, Outcome, describe
 from githerd.recover import STASH_PULL_COMMAND, auto_stash_present, stash_and_pull, stash_tip
@@ -170,11 +170,12 @@ def _resolve_one(
                 raise
         elif action.id == "auth":
             _note(console, f"  running git fetch for {label} (git may ask for credentials)...")
-            _command_note(console, FETCH_COMMAND)
+            _command_note(console, FETCH_COMMAND)  # the hand-off, then the pull that follows it
+            _command_note(console, PULL_COMMAND)
             outcome = _mutate(repo, heads, authenticate)
         else:  # retry
             _note(console, f"  pulling {label}...")
-            _command_note(console, PULL_FF_COMMAND)
+            _command_note(console, PULL_COMMAND)
             outcome = _mutate(repo, heads, lambda: asyncio.run(_bounded(pull(repo), timeout)))
         _note(console, f"  {describe(outcome)}")
     return outcome, False

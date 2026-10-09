@@ -1,5 +1,6 @@
 import asyncio
 import io
+import re
 import signal
 import subprocess
 
@@ -782,3 +783,93 @@ def test_plain_undo_lines_do_not_wrap_at_80_columns(monkeypatch, tmp_path):
     assert len(lines) == 3, result.output  # the heading plus one line per item
     skipped = [ln for ln in lines if long_dir in ln]
     assert len(skipped) == 1 and skipped[0].endswith("not undone") and len(skipped[0]) > 80
+
+
+# ---- H5/H6 review: one label map for the dashboard, the cards, status and undo ------------------------------
+
+def _two_api_repos(make_repo, tmp_path):
+    """``root/api`` and ``root/x/api``; returns ``(root, root_api, nested_api)``."""
+    root = tmp_path / "work"
+    top = make_repo("api")
+    staged = make_repo("api-x", parent=root / "x")  # a distinct remote name, renamed to the clash
+    nested = root / "x" / "api"
+    staged.rename(nested)
+    return root, top, nested
+
+
+def _bare_api(text: str):
+    """A match for ``api`` that is not the tail of a longer path such as ``x/api``."""
+    return re.search(r"(?<![/\w-])api\b", text)
+
+
+def test_undo_keeps_the_disambiguated_label_when_only_one_duplicate_was_journaled(
+    make_repo, push_upstream, tmp_path
+):
+    root, _, nested = _two_api_repos(make_repo, tmp_path)
+    push_upstream(nested, "new.txt")  # only x/api moves, so only x/api is journaled
+    assert runner.invoke(app, ["pull", "--root", str(root)]).exit_code == 0
+    result = runner.invoke(app, ["undo", "--root", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "+ x/api  restored" in result.output
+    assert _bare_api(result.output) is None, result.output
+
+
+def test_the_undo_prompt_names_the_disambiguated_label(
+    make_repo, push_upstream, commit_local, git, monkeypatch, tmp_path
+):
+    root, _, nested = _two_api_repos(make_repo, tmp_path)
+    before = git(nested, "rev-parse", "HEAD")
+    push_upstream(nested, "new.txt")
+    assert runner.invoke(app, ["pull", "--root", str(root)]).exit_code == 0
+    commit_local(nested, "mine.txt")
+    console = _terminal(monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    assert runner.invoke(app, ["undo", "--root", str(root)]).exit_code == 2
+    text = console.export_text()
+    assert f"git reset --keep {before[:7]}  (x/api)" in text
+    assert "affects 1 repo: x/api" in text
+    assert "x/api is on 'main'; 1 newer commit will be dropped from it (kept in the reflog)" in text
+    assert "x/api  skipped" in text
+    assert _bare_api(text) is None, text
+
+
+def test_the_undo_prompt_label_matches_the_result_line_for_unique_names_too(
+    make_repo, push_upstream, commit_local, git, monkeypatch, tmp_path
+):
+    console = _terminal(monkeypatch)
+    root = tmp_path / "work"
+    _pulled_and_moved(make_repo, push_upstream, commit_local, git, runner, root)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    runner.invoke(app, ["undo", "--root", str(root)])
+    text = console.export_text()
+    assert "(a)" in text and "affects 1 repo: a" in text and "a  skipped" in text
+
+
+def test_undo_labels_journaled_repos_that_no_longer_exist_under_the_root(tmp_path):
+    from githerd.journal import Journal, JournalEntry
+
+    root = tmp_path / "work"
+    (root / "api" / ".git").mkdir(parents=True)  # a live repo that shares the name
+    gone, outside = root / "gone" / "api", tmp_path / "elsewhere" / "api"
+    entries = [
+        JournalEntry(repo=str(path), op="pull", before_head="a" * 40, after_head="b" * 40)
+        for path in (gone, outside)
+    ]
+    Journal(root.resolve()).record("pull 2 repos", entries)
+    result = runner.invoke(app, ["undo", "--root", str(root)])
+    assert result.exit_code == 2, result.output
+    lines = result.output.splitlines()
+    assert any(ln.startswith("! gone/api  skipped") for ln in lines), result.output
+    assert any(ln.startswith(f"! {outside.as_posix()}  skipped") for ln in lines), result.output
+
+
+# ---- H5/H6 review: the displayed pull command is the one that runs --------------------------------------------
+
+def test_interactive_pull_shows_exactly_the_command_built_from_pull_args(make_repo, push_upstream, monkeypatch, tmp_path):
+    from githerd.gitops import PULL_ARGS
+
+    console = _styled_terminal(monkeypatch)
+    root = tmp_path / "work"
+    push_upstream(make_repo("a"), "n.txt")
+    assert runner.invoke(app, ["pull", "--root", str(root)]).exit_code == 0
+    assert "$ " + " ".join(["git", *PULL_ARGS]) in console.export_text(clear=False)

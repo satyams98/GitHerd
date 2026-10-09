@@ -236,9 +236,8 @@ def head_and_branch_sync(repo: Path | str) -> tuple[str, str | None] | None:
 PULL_ARGS = ("pull", "--ff-only", "--progress")
 # What the bulk pull runs, shown (dim) under the dashboard; built from PULL_ARGS so the two cannot drift.
 PULL_COMMAND = "git " + " ".join(PULL_ARGS)
-# The attention actions show these (dim) before running them: a retry is the same pull, and
-# authenticating is an interactive fetch.
-PULL_FF_COMMAND = "git pull --ff-only"
+# The attention actions show these (dim) before running them: a retry is the same PULL_COMMAND,
+# and authenticating is an interactive fetch followed by that pull.
 FETCH_COMMAND = "git fetch"
 
 

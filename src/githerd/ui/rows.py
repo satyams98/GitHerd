@@ -50,6 +50,26 @@ def fit(text: str, width: int, glyphs: Glyphs) -> str:
     return set_cell_size(text, width - marker_w) + marker
 
 
+def fit_label(text: str, width: int, glyphs: Glyphs) -> str:
+    """Like ``fit`` for a repo label, but a path label (one with ``/``) keeps its TAIL.
+
+    The distinguishing part of ``org/team-a/api`` is its last segments, so when it is too long
+    the glyph set's ellipsis goes at the START (``.../team-a/api``) and the end is kept. A label
+    without ``/`` is cut at the end exactly as ``fit`` does. The result is at most ``width`` cells.
+    """
+    if "/" not in text or width <= 0 or cell_len(text) <= width:
+        return fit(text, width, glyphs)
+    marker = glyphs.ellipsis
+    marker_w = cell_len(marker)
+    if width <= marker_w:
+        return set_cell_size(marker, width)
+    room = width - marker_w
+    for start in range(len(text)):
+        if cell_len(text[start:]) <= room:
+            return set_cell_size(marker + text[start:], width)
+    return set_cell_size(marker, width)
+
+
 def _pad(text: str, width: int) -> str:
     """Pad with spaces to ``width`` cells (cell-aware replacement for ``str.ljust``)."""
     return text + " " * max(0, width - cell_len(text))
@@ -104,7 +124,7 @@ def render_row(
     glyph, style = _glyph_and_style(state, glyphs)
     line = Text()
     line.append(f"{glyph} ", style=style)
-    line.append(_pad(fit(safe_path(state.name), name_w, glyphs), name_w), style="subject")
+    line.append(_pad(fit_label(safe_path(state.name), name_w, glyphs), name_w), style="subject")
     line.append("  " + _pad(fit(state.branch, branch_w, glyphs), branch_w), style="dim")
     line.append("  ")
     detail_style = "dim" if state.status == "queued" or isinstance(state.outcome, UpToDate) else ""
@@ -155,7 +175,7 @@ def render_status(
             first = clean_message(snap.error.splitlines()[0]) if snap.error.strip() else snap.error
             line = Text()
             line.append(f"{glyphs.fail} ", style="error")
-            line.append(_pad(fit(name, name_w, glyphs), name_w), style="subject")
+            line.append(_pad(fit_label(name, name_w, glyphs), name_w), style="subject")
             line.append(f"  error: {first}", style="error")
             if width is not None:
                 _clip(line, width, glyphs)
@@ -165,7 +185,7 @@ def render_status(
         branch = snap.branch or "(detached)"
         changes = f"{len(snap.dirty)} changed" if snap.dirty else "clean"
         out.append(f"{glyph} ", style=style)
-        out.append(_pad(fit(name, name_w, glyphs), name_w), style="subject")
+        out.append(_pad(fit_label(name, name_w, glyphs), name_w), style="subject")
         out.append("  " + _pad(fit(branch, branch_w, glyphs), branch_w), style="dim")
         out.append("  " + _pad(_sync_text(snap, glyphs), sync_w), style="dim")
         out.append("  ")  # columns are always separated, whatever the sync text width

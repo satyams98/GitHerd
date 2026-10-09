@@ -8,7 +8,7 @@ from githerd.outcomes import (
     AuthRequired, BlockedDirty, Conflict, Diverged, Failed, FileChange, NetworkError, Ok, UpToDate,
 )
 from githerd.repos import RepoSnapshot
-from githerd.ui.rows import RowState, bar, fit, render_row, render_status
+from githerd.ui.rows import RowState, bar, fit, fit_label, render_row, render_status
 from githerd.ui.theme import ASCII_GLYPHS, UNICODE_GLYPHS
 
 
@@ -349,3 +349,44 @@ def test_render_status_labels_apply_to_error_lines_and_default_to_the_name():
     b = _snap_at("/w/docs", branch="main")
     lines = render_status([a, b], ASCII_GLYPHS, labels={a.path: "team-a/api"}).plain.splitlines()
     assert lines[0].startswith("x team-a/api") and lines[1].startswith("+ docs")
+
+
+# ---- tail-preserving fit for path labels ------------------------------------------------------------
+
+LONG_A = "very-long-organisation-name/a/api"
+LONG_B = "very-long-organisation-name/b/api"
+
+
+def test_fit_label_keeps_the_tail_of_a_path_label_with_the_marker_first():
+    assert fit_label(LONG_A, 24, ASCII_GLYPHS) == "...ganisation-name/a/api"
+    assert fit_label(LONG_A, 24, UNICODE_GLYPHS) == "…organisation-name/a/api"
+
+
+def test_fit_label_leaves_a_label_that_fits_and_names_without_a_slash_to_fit():
+    assert fit_label("x/api", 24, ASCII_GLYPHS) == "x/api"
+    for glyphs in (ASCII_GLYPHS, UNICODE_GLYPHS):
+        assert fit_label("a-very-long-name", 8, glyphs) == fit("a-very-long-name", 8, glyphs)
+
+
+@pytest.mark.parametrize("glyphs", [UNICODE_GLYPHS, ASCII_GLYPHS], ids=["unicode", "ascii"])
+@pytest.mark.parametrize("width", range(0, 40))
+def test_fit_label_is_never_wider_than_the_width_and_keeps_the_last_segment(width, glyphs):
+    out = fit_label(LONG_A, width, glyphs)
+    assert cell_len(out) <= width
+    if cell_len(glyphs.ellipsis) + len("/a/api") < width < len(LONG_A):  # truncated, with room for the tail
+        assert out.startswith(glyphs.ellipsis) and out.endswith("/a/api")
+
+
+def test_fit_label_wide_characters_stay_within_the_width():
+    label = "日本語/リポ/ツール"
+    for width in range(1, 20):
+        assert cell_len(fit_label(label, width, UNICODE_GLYPHS)) <= width
+
+
+def test_two_long_labels_stay_distinguishable_in_a_status_name_column():
+    a = _snap_at("/w/" + LONG_A, branch="main")
+    b = _snap_at("/w/" + LONG_B, branch="main")
+    labels = {a.path: LONG_A, b.path: LONG_B}
+    first, second = render_status([a, b], ASCII_GLYPHS, labels=labels).plain.splitlines()
+    assert "/a/api" in first and "/b/api" in second
+    assert first.split("  ")[0] != second.split("  ")[0]
